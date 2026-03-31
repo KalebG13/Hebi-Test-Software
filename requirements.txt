@@ -1,0 +1,4 @@
+hebi-py==2.13.1
+matplotlib==3.10.8
+pynput==1.8.1
+PySide6==6.11.0
