@@ -15,6 +15,26 @@ Initial development date: March 2026.
 - `matplotlib`
 - `pynput`
 
+## Setup
+
+Create the virtual environment:
+
+```powershell
+python -m venv .venv
+```
+
+Activate it:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Install the required packages:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
 ## Run
 
 ```powershell
