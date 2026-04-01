@@ -5,10 +5,13 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
+from PySide6.QtCore import QLocale, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -23,6 +26,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -32,6 +37,7 @@ from PySide6.QtWidgets import (
 from wheel_test_app.hebi_service import (
     DiscoveredModule,
     HebiWheelService,
+    MODE_CONFIG,
     TelemetrySample,
     TestPlan,
     build_test_plan,
@@ -42,7 +48,11 @@ LAB_CHECKLIST_ITEMS = [
     "Camera On",
     "OptiTrack On (optional)",
     "Picture after Ex.",
+    "Picture after Dep.",
 ]
+#Delay durations for the pre-roll and post-roll phases, which capture data before the wheel starts moving and after it stops so the CSV includes the baseline and settling behavior.
+PRE_ROLL_SECONDS = 1.0
+POST_ROLL_SECONDS = 1.0
 
 
 class ProgressBar(QFrame):
@@ -80,14 +90,23 @@ class WheelChoicePage(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(24)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
 
-        logo_label = QLabel()
-        logo_label.setObjectName("LogoLabel")
-        logo_label.setAlignment(Qt.AlignCenter)
-        self._set_logo_pixmap(logo_label)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+
+        content_widget = QWidget()
+        self.page_layout = QVBoxLayout(content_widget)
+        self.page_layout.setContentsMargins(40, 40, 40, 40)
+        self.page_layout.setSpacing(24)
+
+        self.logo_label = QLabel()
+        self.logo_label.setObjectName("LogoLabel")
+        self.logo_label.setAlignment(Qt.AlignCenter)
+        self.logo_pixmap = self._load_logo_pixmap()
+        self._update_logo_pixmap()
 
         title = QLabel("Wheel Test Bench")
         title.setObjectName("PageTitle")
@@ -96,8 +115,8 @@ class WheelChoicePage(QWidget):
         subtitle.setObjectName("PageSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
 
-        cards_layout = QHBoxLayout()
-        cards_layout.setSpacing(20)
+        self.cards_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        self.cards_layout.setSpacing(20)
 
         one_wheel_card, one_wheel_button = self._build_card(
             title="1 Wheel",
@@ -113,17 +132,21 @@ class WheelChoicePage(QWidget):
         )
         two_wheel_button.setEnabled(False)
 
-        cards_layout.addWidget(one_wheel_card)
-        cards_layout.addWidget(two_wheel_card)
+        self.cards_layout.addWidget(one_wheel_card)
+        self.cards_layout.addWidget(two_wheel_card)
 
-        layout.addWidget(logo_label)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addSpacing(12)
-        layout.addLayout(cards_layout)
-        layout.addStretch(1)
+        self.page_layout.addWidget(self.logo_label)
+        self.page_layout.addWidget(title)
+        self.page_layout.addWidget(subtitle)
+        self.page_layout.addSpacing(12)
+        self.page_layout.addLayout(self.cards_layout)
+        self.page_layout.addStretch(1)
 
-    def _set_logo_pixmap(self, label: QLabel) -> None:
+        scroll_area.setWidget(content_widget)
+        outer_layout.addWidget(scroll_area)
+        self._update_responsive_layout()
+
+    def _load_logo_pixmap(self) -> QPixmap | None:
         figures_dir = Path(__file__).resolve().parent.parent / "fig"
         for file_name in ("srl_logo.jpg", "srl_logo.png", "slr_logo.png"):
             logo_path = figures_dir / file_name
@@ -134,11 +157,29 @@ class WheelChoicePage(QWidget):
             if pixmap.isNull():
                 continue
 
-            scaled = pixmap.scaledToHeight(350, Qt.SmoothTransformation)
-            label.setPixmap(scaled)
+            return pixmap
+
+        return None
+
+    def _update_logo_pixmap(self) -> None:
+        if self.logo_pixmap is None:
+            self.logo_label.setText("SRL")
             return
 
-        label.setText("SRL")
+        target_height = max(100, min(260, self.width() // 4))
+        scaled = self.logo_pixmap.scaledToHeight(target_height, Qt.SmoothTransformation)
+        self.logo_label.setPixmap(scaled)
+
+    def _update_responsive_layout(self) -> None:
+        if self.width() < 900:
+            self.cards_layout.setDirection(QBoxLayout.TopToBottom)
+        else:
+            self.cards_layout.setDirection(QBoxLayout.LeftToRight)
+        self._update_logo_pixmap()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_responsive_layout()
 
     def _build_card(self, title: str, description: str, button_text: str) -> tuple[QFrame, QPushButton]:
         frame = QFrame()
@@ -174,13 +215,16 @@ class SingleWheelTestPage(QWidget):
         self._csv_writer = None
         self._current_data_path: Path | None = None
         self._zero_move_started_at: float | None = None
-        
         # Deployment samples are buffered in memory because the CSV is exported
-        
         # only after the operator enters the collected mass.
-
         self._pending_deployment_plan: TestPlan | None = None
         self._pending_deployment_samples: list[TelemetrySample] = []
+        self._max_chart_points = 300
+        self._test_phase = "idle"
+        self._pending_finish_message = ""
+        self._motion_started_at: float | None = None
+        self._post_roll_started_at: float | None = None
+        self._motion_elapsed_before_post_roll = 0.0
 
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(100)
@@ -189,7 +233,15 @@ class SingleWheelTestPage(QWidget):
         self.zero_timer.setInterval(100)
         self.zero_timer.timeout.connect(self._poll_zero_move)
 
-        root = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+
+        content_widget = QWidget()
+        root = QVBoxLayout(content_widget)
         root.setContentsMargins(28, 28, 28, 28)
         root.setSpacing(20)
 
@@ -202,16 +254,22 @@ class SingleWheelTestPage(QWidget):
         toolbar.addWidget(header, 0, Qt.AlignVCenter)
         toolbar.addStretch(1)
 
-        content = QHBoxLayout()
-        content.setSpacing(20)
-        content.addWidget(self._build_configuration_panel(), 2)
-        content.addWidget(self._build_runtime_panel(), 3)
+        self.configuration_panel = self._build_configuration_panel()
+        self.runtime_panel = self._build_runtime_panel()
+        self.content_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        self.content_layout.setSpacing(20)
+        self.content_layout.addWidget(self.configuration_panel, 2)
+        self.content_layout.addWidget(self.runtime_panel, 3)
 
         root.addLayout(toolbar)
-        root.addLayout(content)
+        root.addLayout(self.content_layout)
+
+        scroll_area.setWidget(content_widget)
+        outer_layout.addWidget(scroll_area)
 
         self._update_derived_fields()
         self._refresh_available_motors()
+        self._update_responsive_layout()
 
     def _build_configuration_panel(self) -> QWidget:
         panel = QWidget()
@@ -226,30 +284,36 @@ class SingleWheelTestPage(QWidget):
         self.test_number_input.setMinimum(1)
         self.test_number_input.setMaximum(9999)
         self.test_number_input.setValue(1)
+        self.test_number_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
 
         self.revolutions_input = QDoubleSpinBox()
         self.revolutions_input.setRange(0.1, 10000.0)
         self.revolutions_input.setDecimals(2)
         self.revolutions_input.setValue(2.0)
         self.revolutions_input.setSuffix(" rev")
+        self.revolutions_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
 
         self.velocity_input = QDoubleSpinBox()
         self.velocity_input.setRange(0.1, 5000.0)
         self.velocity_input.setDecimals(2)
         self.velocity_input.setValue(14.0) #Max velocity for the first prototype at 35V 5A is around 15 rpm, so 14 rpm gives a little headroom for testing.
         self.velocity_input.setSuffix(" rpm")
+        self.velocity_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
 
         self.mode_input = QComboBox()
-        self.mode_input.addItems(["Excavation", "Deployment"])
+        self.mode_input.addItems(list(MODE_CONFIG.keys()))
 
         self.direction_label = QLabel()
         self.duration_label = QLabel()
         self.velocity_rad_label = QLabel()
+        self.file_prefix_input = QLineEdit()
+        self.file_prefix_input.setPlaceholderText("Example: Slanted_Grouser")
         self.mass_input = QDoubleSpinBox()
         self.mass_input.setRange(0.0, 1000.0)
         self.mass_input.setDecimals(4)
         self.mass_input.setValue(0.0)
         self.mass_input.setSuffix(" kg")
+        self.mass_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.mass_label = QLabel("Collected Mass")
 
         self.revolutions_input.valueChanged.connect(self._update_derived_fields)
@@ -263,6 +327,7 @@ class SingleWheelTestPage(QWidget):
         form.addRow("Direction", self.direction_label)
         form.addRow("Estimated Time", self.duration_label)
         form.addRow("Velocity (rad/s)", self.velocity_rad_label)
+        form.addRow("File Prefix", self.file_prefix_input)
         form.addRow(self.mass_label, self.mass_input)
 
         hebi_box = QGroupBox("HEBI Connection")
@@ -305,6 +370,7 @@ class SingleWheelTestPage(QWidget):
         actions.addWidget(self.zero_button)
         actions.addWidget(self.export_button)
 
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout.addWidget(test_box)
         layout.addWidget(self._build_checklist_box())
         layout.addWidget(hebi_box)
@@ -314,13 +380,16 @@ class SingleWheelTestPage(QWidget):
 
     def _build_checklist_box(self) -> QGroupBox:
         checklist_box = QGroupBox("Laboratory Checklist")
-        checklist_layout = QVBoxLayout(checklist_box)
-        checklist_layout.setSpacing(8)
+        checklist_layout = QGridLayout(checklist_box)
+        checklist_layout.setHorizontalSpacing(16)
+        checklist_layout.setVerticalSpacing(8)
 
         self.checklist_boxes: list[QCheckBox] = []
-        for item in LAB_CHECKLIST_ITEMS:
+        for index, item in enumerate(LAB_CHECKLIST_ITEMS):
             checkbox = QCheckBox(item)
-            checklist_layout.addWidget(checkbox)
+            row = index // 2
+            column = index % 2
+            checklist_layout.addWidget(checkbox, row, column)
             self.checklist_boxes.append(checkbox)
 
         return checklist_box
@@ -356,6 +425,7 @@ class SingleWheelTestPage(QWidget):
             ("Effort", "effort"),
             ("Voltage", "voltage"),
             ("Current", "current"),
+            ("Accel X", "accel_x"),
             ("Winding Temp", "temperature"),
         ]
         for row, (label_text, key) in enumerate(fields):
@@ -366,14 +436,63 @@ class SingleWheelTestPage(QWidget):
             telemetry_grid.addWidget(value, row, 1)
             self.telemetry_labels[key] = value
 
+        charts = QGroupBox("Live Graphs")
+        charts_layout = QHBoxLayout(charts)
+        charts_layout.setSpacing(12)
+        self.effort_series, self.effort_chart_view = self._build_chart("Effort vs Time", "Time (s)", "Effort (Nm)")
+        self.power_series, self.power_chart_view = self._build_chart("Power vs Time", "Time (s)", "Power (W)")
+        charts_layout.addWidget(self.effort_chart_view, 1)
+        charts_layout.addWidget(self.power_chart_view, 1)
+
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setPlaceholderText("Test messages will appear here.")
+        self.log_output.setMaximumHeight(110)
 
         layout.addWidget(summary)
         layout.addWidget(telemetry)
+        layout.addWidget(charts, 1)
         layout.addWidget(self.log_output, 1)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         return panel
+
+    def _build_chart(self, title: str, x_title: str, y_title: str) -> tuple[QLineSeries, QChartView]:
+        series = QLineSeries()
+        chart = QChart()
+        chart.addSeries(series)
+        chart.setTitle(title)
+        chart.legend().hide()
+        chart.setBackgroundVisible(False)
+        chart.setPlotAreaBackgroundVisible(False)
+
+        axis_x = QValueAxis()
+        axis_x.setTitleText(x_title)
+        axis_x.setRange(0.0, 10.0)
+        axis_x.setLabelFormat("%.1f")
+
+        axis_y = QValueAxis()
+        axis_y.setTitleText(y_title)
+        axis_y.setRange(0.0, 10.0)
+        axis_y.setLabelFormat("%.2f")
+
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_x)
+        series.attachAxis(axis_y)
+
+        chart_view = QChartView(chart)
+        chart_view.setMinimumHeight(220)
+        return series, chart_view
+
+    def _update_responsive_layout(self) -> None:
+        if self.width() < 1200:
+            self.content_layout.setDirection(QBoxLayout.TopToBottom)
+        else:
+            self.content_layout.setDirection(QBoxLayout.LeftToRight)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_responsive_layout()
 
     def _update_derived_fields(self) -> None:
         try:
@@ -437,6 +556,10 @@ class SingleWheelTestPage(QWidget):
         if self._pending_deployment_plan is not None:
             QMessageBox.warning(self, "Pending deployment export", "Export the previous deployment data before starting a new test.")
             return
+        if not self._file_prefix():
+            QMessageBox.warning(self, "Missing file prefix", "Write a file prefix before starting the test.")
+            return
+        
 
         try:
             self._current_plan = build_test_plan(
@@ -450,18 +573,20 @@ class SingleWheelTestPage(QWidget):
             return
 
         if self.hebi_service.is_connected:
-            success, message = self.hebi_service.start_velocity_test(self._current_plan)
-            if not success:
-                self._close_data_file()
-                QMessageBox.warning(self, "HEBI start failed", message)
-                return
+            message = "Connected to HEBI actuator. Recording 1.0 s of baseline data before the wheel starts moving."
             self._running_in_preview = False
         else:
-            message = "Starting preview mode. Connect a HEBI actuator to stream live feedback."
+            message = "Starting preview mode. Recording 1.0 s of baseline data before the simulated motion starts."
             self._running_in_preview = True
 
         self._prepare_test_storage(self._current_plan)
+        self._reset_charts()
         self._test_started_at = time.monotonic()
+        self._test_phase = "pre_roll"
+        self._pending_finish_message = ""
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.connect_button.setEnabled(False)
@@ -469,27 +594,31 @@ class SingleWheelTestPage(QWidget):
         self.zero_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.execution_label.setText(
-            f"Running Test #{self._current_plan.test_number}: {self._current_plan.mode} / "
-            f"{self._current_plan.direction_label.lower()}."
+            "Pre-test capture: collecting 1.0 s of data before motion starts so the CSV shows the baseline."
         )
         self._append_log(message)
         if self._current_plan.uses_stopwatch:
             self._append_log(
-                f"Deployment target: {self._current_plan.velocity_rpm:.2f} rpm. Stopwatch is active until Stop is pressed."
+                f"{self._current_plan.test_type} target for the {self._current_plan.wheel_side.lower()} wheel: "
+                f"{self._current_plan.velocity_rpm:.2f} rpm. Stopwatch is active until Stop is pressed."
             )
             self.progress_bar.set_value(0)
-            self.progress_text.setText("0.0 s")
+            self.progress_text.setText("Pre-roll 0.0 / 1.0 s")
         else:
             self._append_log(
-                f"Excavation target: {self._current_plan.revolutions:.2f} rev at {self._current_plan.velocity_rpm:.2f} rpm "
+                f"{self._current_plan.test_type} target for the {self._current_plan.wheel_side.lower()} wheel: "
+                f"{self._current_plan.revolutions:.2f} rev at {self._current_plan.velocity_rpm:.2f} rpm "
                 f"for {self._current_plan.duration_seconds:.2f} s."
             )
             self.progress_bar.set_value(0)
-            self.progress_text.setText("0%")
+            self.progress_text.setText("Pre-roll 0.0 / 1.0 s")
         self.poll_timer.start()
 
     def _stop_test(self) -> None:
-        self._finish_test("Test stopped by user.")
+        if self._test_phase == "pre_roll":
+            self._complete_test_run("Test cancelled before motion started.")
+            return
+        self._begin_post_roll("Test stopped by user.")
 
     def _zero_position(self) -> None:
         if self.poll_timer.isActive():
@@ -534,29 +663,71 @@ class SingleWheelTestPage(QWidget):
             return
 
         elapsed = time.monotonic() - self._test_started_at
-        if self._current_plan.duration_seconds is not None:
-            progress = min(100, int((elapsed / self._current_plan.duration_seconds) * 100))
-            self.progress_bar.set_value(progress)
-            self.progress_text.setText(f"{progress}% | {elapsed:.1f} s")
-        else:
-            self.progress_bar.set_value(0)
-            self.progress_text.setText(f"{elapsed:.1f} s")
-
-        if self._running_in_preview:
-            sample = self.hebi_service.preview_feedback(self._current_plan, elapsed)
-        else:
-            self.hebi_service.refresh_velocity_command(self._current_plan) # Refresh the command continuously while the wheel is spinning.
-            sample = self.hebi_service.read_feedback(elapsed)
-            if sample is None:
-                sample = self.hebi_service.preview_feedback(self._current_plan, elapsed)
+        sample = self._sample_for_phase(elapsed)
 
         self._update_telemetry(sample)
+        self._update_charts(sample)
         self._record_sample(sample)
 
-        if self._current_plan.duration_seconds is not None and elapsed >= self._current_plan.duration_seconds:
-            self._finish_test("Test completed.")
+        if self._test_phase == "pre_roll" and elapsed >= PRE_ROLL_SECONDS:
+            self._begin_motion_phase()
+            return
 
-    def _finish_test(self, message: str) -> None:
+        if self._test_phase == "active" and self._current_plan.duration_seconds is not None:
+            active_elapsed = max(0.0, elapsed - PRE_ROLL_SECONDS)
+            if active_elapsed >= self._current_plan.duration_seconds:
+                self._begin_post_roll("Test completed.")
+                return
+
+        if self._test_phase == "post_roll" and self._post_roll_started_at is not None:
+            post_roll_elapsed = time.monotonic() - self._post_roll_started_at
+            if post_roll_elapsed >= POST_ROLL_SECONDS:
+                self._complete_test_run(self._pending_finish_message or "Test completed.")
+
+    def _begin_motion_phase(self) -> None:
+        if self._current_plan is None:
+            return
+
+        if not self._running_in_preview:
+            success, message = self.hebi_service.start_velocity_test(self._current_plan)
+            if not success:
+                self._abort_test_run("HEBI start failed", message)
+                return
+            self._append_log(message)
+
+        self._test_phase = "active"
+        self._motion_started_at = time.monotonic()
+        self.execution_label.setText(
+            "Motion phase: the 1.0 s delay is finished, and the wheel command is now active."
+        )
+        if self._current_plan.uses_stopwatch:
+            self.progress_bar.set_value(0)
+            self.progress_text.setText("0.0 s")
+        else:
+            self.progress_bar.set_value(0)
+            self.progress_text.setText("0% | 0.0 s")
+
+    def _begin_post_roll(self, message: str) -> None:
+        if self._current_plan is None or self._test_started_at is None:
+            return
+
+        self.hebi_service.stop()
+        self._test_phase = "post_roll"
+        self._pending_finish_message = message
+        self._post_roll_started_at = time.monotonic()
+        self._motion_elapsed_before_post_roll = max(0.0, time.monotonic() - self._test_started_at - PRE_ROLL_SECONDS)
+        self.stop_button.setEnabled(False)
+        self.execution_label.setText(
+            "Post-test capture: collecting 1.0 s of data after stop so the CSV shows the system settling."
+        )
+        if self._current_plan.duration_seconds is not None:
+            self.progress_bar.set_value(100)
+        else:
+            self.progress_bar.set_value(0)
+        self.progress_text.setText("Post-roll 0.0 / 1.0 s")
+        self._append_log("Motion stopped. Recording 1.0 s of post-test data before closing the test.")
+
+    def _complete_test_run(self, message: str) -> None:
         elapsed = 0.0
         if self._test_started_at is not None:
             elapsed = time.monotonic() - self._test_started_at
@@ -567,17 +738,18 @@ class SingleWheelTestPage(QWidget):
         self.connect_button.setEnabled(True)
         self.refresh_motors_button.setEnabled(True)
         self.zero_button.setEnabled(True)
+        self._test_phase = "idle"
         self.execution_label.setText(message)
         self._append_log(message)
         if self._current_plan is not None and self._current_plan.duration_seconds is not None:
-            final_progress = 100 if message == "Test completed." else min(
-                100, int((elapsed / self._current_plan.duration_seconds) * 100)
+            final_progress = 100 if self._motion_elapsed_before_post_roll >= self._current_plan.duration_seconds else min(
+                100, int((self._motion_elapsed_before_post_roll / self._current_plan.duration_seconds) * 100)
             )
             self.progress_bar.set_value(final_progress)
-            self.progress_text.setText(f"{final_progress}% | {elapsed:.1f} s")
+            self.progress_text.setText(f"{final_progress}% | {elapsed:.1f} s recorded")
         else:
             self.progress_bar.set_value(0)
-            self.progress_text.setText(f"{elapsed:.1f} s")
+            self.progress_text.setText(f"{elapsed:.1f} s recorded")
 
         if self._current_data_path is not None:
             self._append_log(f"Data saved to {self._current_data_path}")
@@ -595,6 +767,117 @@ class SingleWheelTestPage(QWidget):
 
         self._current_plan = None
         self._test_started_at = None
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._pending_finish_message = ""
+        self._motion_elapsed_before_post_roll = 0.0
+
+    def _abort_test_run(self, title: str, message: str) -> None:
+        self.poll_timer.stop()
+        self.hebi_service.stop()
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(True)
+        self.connect_button.setEnabled(True)
+        self.refresh_motors_button.setEnabled(True)
+        self.zero_button.setEnabled(True)
+        self.export_button.setEnabled(False)
+        self.execution_label.setText(message)
+        self.progress_bar.set_value(0)
+        self.progress_text.setText("Ready")
+        self._append_log(message)
+
+        abandoned_path = self._current_data_path
+        self._close_data_file()
+        if abandoned_path is not None and abandoned_path.exists():
+            abandoned_path.unlink()
+        self._current_data_path = None
+        self.data_file_label.setText("No data file created yet.")
+        self._pending_deployment_plan = None
+        self._pending_deployment_samples = []
+        self._current_plan = None
+        self._test_started_at = None
+        self._test_phase = "idle"
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._pending_finish_message = ""
+        self._motion_elapsed_before_post_roll = 0.0
+        QMessageBox.warning(self, title, message)
+
+    def _sample_for_phase(self, elapsed: float) -> TelemetrySample:
+        if self._current_plan is None:
+            raise RuntimeError("No active test plan.")
+
+        if self._test_phase == "pre_roll":
+            self.progress_bar.set_value(0)
+            self.progress_text.setText(f"Pre-roll {min(elapsed, PRE_ROLL_SECONDS):.1f} / {PRE_ROLL_SECONDS:.1f} s")
+            self.execution_label.setText(
+                "Pre-test capture: collecting 1.0 s of data before motion starts so the CSV shows the baseline."
+            )
+            return self._read_or_preview_sample(elapsed, motion_elapsed=0.0, motion_active=False)
+
+        if self._test_phase == "post_roll":
+            post_roll_elapsed = 0.0 if self._post_roll_started_at is None else time.monotonic() - self._post_roll_started_at
+            if self._current_plan.duration_seconds is not None:
+                self.progress_bar.set_value(100)
+            else:
+                self.progress_bar.set_value(0)
+            self.progress_text.setText(
+                f"Post-roll {min(post_roll_elapsed, POST_ROLL_SECONDS):.1f} / {POST_ROLL_SECONDS:.1f} s"
+            )
+            self.execution_label.setText(
+                "Post-test capture: collecting 1.0 s of data after stop so the CSV shows the system settling."
+            )
+            return self._read_or_preview_sample(
+                elapsed,
+                motion_elapsed=self._motion_elapsed_before_post_roll,
+                motion_active=False,
+            )
+
+        active_elapsed = max(0.0, elapsed - PRE_ROLL_SECONDS)
+        if self._current_plan.duration_seconds is not None:
+            progress = min(100, int((active_elapsed / self._current_plan.duration_seconds) * 100))
+            self.progress_bar.set_value(progress)
+            self.progress_text.setText(f"{progress}% | {active_elapsed:.1f} s")
+        else:
+            self.progress_bar.set_value(0)
+            self.progress_text.setText(f"{active_elapsed:.1f} s")
+        self.execution_label.setText(
+            f"Motion phase: {self._current_plan.mode} is running. The CSV includes 1.0 s before motion and 1.0 s after stop."
+        )
+        return self._read_or_preview_sample(elapsed, motion_elapsed=active_elapsed, motion_active=True)
+
+    def _read_or_preview_sample(self, elapsed: float, motion_elapsed: float, motion_active: bool) -> TelemetrySample:
+        if self._current_plan is None:
+            raise RuntimeError("No active test plan.")
+
+        if self._running_in_preview:
+            return self._preview_sample(self._current_plan, elapsed, motion_elapsed, motion_active)
+
+        if motion_active:
+            self.hebi_service.refresh_velocity_command(self._current_plan)  # Refresh the command continuously while the wheel is spinning.
+        sample = self.hebi_service.read_feedback(elapsed)
+        if sample is None:
+            return self._preview_sample(self._current_plan, elapsed, motion_elapsed, motion_active)
+        return sample
+
+    def _preview_sample(
+        self,
+        plan: TestPlan,
+        elapsed: float,
+        motion_elapsed: float,
+        motion_active: bool,
+    ) -> TelemetrySample:
+        if motion_active:
+            sample = self.hebi_service.preview_feedback(plan, motion_elapsed)
+            sample.elapsed_seconds = elapsed
+            return sample
+
+        sample = self.hebi_service.preview_feedback(plan, motion_elapsed)
+        sample.elapsed_seconds = elapsed
+        sample.velocity_rad_s = 0.0
+        sample.effort_nm = 0.0
+        sample.current_a = 0.0
+        return sample
 
     def _update_telemetry(self, sample: TelemetrySample) -> None:
         self.telemetry_labels["position"].setText(f"{sample.position_rad:.3f} rad")
@@ -602,7 +885,51 @@ class SingleWheelTestPage(QWidget):
         self.telemetry_labels["effort"].setText(f"{sample.effort_nm:.3f} Nm")
         self.telemetry_labels["voltage"].setText(f"{sample.voltage_v:.2f} V")
         self.telemetry_labels["current"].setText(f"{sample.current_a:.3f} A")
+        self.telemetry_labels["accel_x"].setText(f"{sample.accel_x_m_s2:.3f} m/s^2")
         self.telemetry_labels["temperature"].setText(f"{sample.winding_temperature_c:.2f} C")
+
+    def _update_charts(self, sample: TelemetrySample) -> None:
+        self.effort_series.append(sample.elapsed_seconds, sample.effort_nm)
+        self.power_series.append(sample.elapsed_seconds, self._power_w(sample))
+        self._trim_chart_series(self.effort_series)
+        self._trim_chart_series(self.power_series)
+        self._update_chart_axes(self.effort_chart_view.chart(), self.effort_series)
+        self._update_chart_axes(self.power_chart_view.chart(), self.power_series)
+
+    def _reset_charts(self) -> None:
+        self.effort_series.clear()
+        self.power_series.clear()
+        self._update_chart_axes(self.effort_chart_view.chart(), self.effort_series)
+        self._update_chart_axes(self.power_chart_view.chart(), self.power_series)
+
+    def _trim_chart_series(self, series: QLineSeries) -> None:
+        while series.count() > self._max_chart_points:
+            series.remove(0)
+
+    def _update_chart_axes(self, chart: QChart, series: QLineSeries) -> None:
+        axes = chart.axes()
+        if len(axes) < 2:
+            return
+
+        axis_x = axes[0]
+        axis_y = axes[1]
+        if series.count() == 0:
+            axis_x.setRange(0.0, 10.0)
+            axis_y.setRange(0.0, 10.0)
+            return
+
+        points = series.points()
+        last_x = points[-1].x()
+        max_y = max(point.y() for point in points)
+        min_y = min(point.y() for point in points)
+        axis_x.setRange(max(0.0, last_x - 10.0), max(10.0, last_x))
+
+        if max_y == min_y:
+            padding = 1.0 if max_y == 0.0 else abs(max_y) * 0.1
+            axis_y.setRange(min_y - padding, max_y + padding)
+        else:
+            padding = max((max_y - min_y) * 0.1, 0.1)
+            axis_y.setRange(min_y - padding, max_y + padding)
 
     def _prepare_test_storage(self, plan: TestPlan) -> None:
         if plan.uses_stopwatch:
@@ -617,9 +944,10 @@ class SingleWheelTestPage(QWidget):
     def _open_data_file(self, plan: TestPlan) -> None:
         self._close_data_file()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(__file__).resolve().parent.parent / "data" / plan.mode.lower()
+        output_dir = Path(__file__).resolve().parent.parent / "data" / plan.test_type.lower()
         output_dir.mkdir(parents=True, exist_ok=True)
-        file_path = output_dir / f"test_{plan.test_number:03d}_{timestamp}.csv"
+        prefix = self._file_prefix()
+        file_path = output_dir / f"{prefix}_test{plan.test_number:03d}_{timestamp}.csv"
 
         self._data_file_handle = file_path.open("w", newline="", encoding="utf-8")
         self._csv_writer = csv.writer(self._data_file_handle)
@@ -635,6 +963,9 @@ class SingleWheelTestPage(QWidget):
                 "voltage_v",
                 "current_a",
                 "power_w",
+                "accel_x_raw_m_s2",
+                "accel_x_m_s2",
+                "accel_y_m_s2",
                 "winding_temperature_c",
             ]
         )
@@ -654,6 +985,9 @@ class SingleWheelTestPage(QWidget):
                     effort_nm=sample.effort_nm,
                     voltage_v=sample.voltage_v,
                     current_a=sample.current_a,
+                    accel_x_raw_m_s2=sample.accel_x_raw_m_s2,
+                    accel_x_m_s2=sample.accel_x_m_s2,
+                    accel_y_m_s2=sample.accel_y_m_s2,
                     winding_temperature_c=sample.winding_temperature_c,
                 )
             )
@@ -674,6 +1008,9 @@ class SingleWheelTestPage(QWidget):
                 f"{sample.voltage_v:.6f}",
                 f"{sample.current_a:.6f}",
                 f"{self._power_w(sample):.6f}",
+                f"{sample.accel_x_raw_m_s2:.6f}",
+                f"{sample.accel_x_m_s2:.6f}",
+                f"{sample.accel_y_m_s2:.6f}",
                 f"{sample.winding_temperature_c:.6f}",
             ]
         )
@@ -686,10 +1023,20 @@ class SingleWheelTestPage(QWidget):
             return
 
         plan = self._pending_deployment_plan
+        collected_mass_kg = self._collected_mass_kg()
+        if collected_mass_kg <= 0.0:
+            QMessageBox.warning(
+                self,
+                "Invalid collected mass",
+                "Deployment data cannot be exported with a collected mass of 0 kg.",
+            )
+            return
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(__file__).resolve().parent.parent / "data" / plan.mode.lower()
+        output_dir = Path(__file__).resolve().parent.parent / "data" / plan.test_type.lower()
         output_dir.mkdir(parents=True, exist_ok=True)
-        file_path = output_dir / f"test_{plan.test_number:03d}_{timestamp}.csv"
+        prefix = self._file_prefix()
+        file_path = output_dir / f"{prefix}_test{plan.test_number:03d}_{timestamp}.csv"
 
         with file_path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
@@ -705,6 +1052,9 @@ class SingleWheelTestPage(QWidget):
                     "voltage_v",
                     "current_a",
                     "power_w",
+                    "accel_x_raw_m_s2",
+                    "accel_x_m_s2",
+                    "accel_y_m_s2",
                     "winding_temperature_c",
                 ]
             )
@@ -713,7 +1063,7 @@ class SingleWheelTestPage(QWidget):
                     [
                         plan.test_number,
                         plan.mode,
-                        f"{self._collected_mass_kg():.4f}",
+                        f"{collected_mass_kg:.4f}",
                         f"{sample.elapsed_seconds:.3f}",
                         f"{sample.position_rad:.6f}",
                         f"{sample.velocity_rad_s:.6f}",
@@ -721,6 +1071,9 @@ class SingleWheelTestPage(QWidget):
                         f"{sample.voltage_v:.6f}",
                         f"{sample.current_a:.6f}",
                         f"{self._power_w(sample):.6f}",
+                        f"{sample.accel_x_raw_m_s2:.6f}",
+                        f"{sample.accel_x_m_s2:.6f}",
+                        f"{sample.accel_y_m_s2:.6f}",
                         f"{sample.winding_temperature_c:.6f}",
                     ]
                 )
@@ -748,6 +1101,15 @@ class SingleWheelTestPage(QWidget):
         for checkbox in self.checklist_boxes:
             checkbox.setChecked(False)
         self.mass_input.setValue(0.0)
+
+    def _file_prefix(self) -> str:
+        raw_prefix = self.file_prefix_input.text().strip()
+        cleaned = raw_prefix.replace(" ", "_")
+        safe_chars = []
+        for char in cleaned:
+            if char.isalnum() or char in {"_", "-"}:
+                safe_chars.append(char)
+        return "".join(safe_chars)
 
     def _collected_mass_kg(self) -> float:
         active_plan = self._current_plan if self._current_plan is not None else self._pending_deployment_plan
@@ -868,6 +1230,8 @@ class MainWindow(QMainWindow):
 
 
 def run() -> None:
+    dot_locale = QLocale(QLocale.English, QLocale.UnitedStates)
+    QLocale.setDefault(dot_locale)
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

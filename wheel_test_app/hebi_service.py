@@ -12,9 +12,34 @@ except ImportError:  # pragma: no cover
     hebi = None
 
 
-MODE_TO_DIRECTION = {
-    "Excavation": ("Clockwise", -1),
-    "Deployment": ("Counter clockwise", 1),
+GRAVITY_M_S2 = -9.8
+
+
+MODE_CONFIG = {
+    "Left Wheel - Excavation": {
+        "test_type": "Excavation",
+        "wheel_side": "Left",
+        "direction_label": "Clockwise",
+        "direction_sign": -1,
+    },
+    "Left Wheel - Deployment": {
+        "test_type": "Deployment",
+        "wheel_side": "Left",
+        "direction_label": "Counter clockwise",
+        "direction_sign": 1,
+    },
+    "Right Wheel - Excavation": {
+        "test_type": "Excavation",
+        "wheel_side": "Right",
+        "direction_label": "Counter clockwise",
+        "direction_sign": 1,
+    },
+    "Right Wheel - Deployment": {
+        "test_type": "Deployment",
+        "wheel_side": "Right",
+        "direction_label": "Clockwise",
+        "direction_sign": -1,
+    },
 }
 
 
@@ -32,6 +57,8 @@ class TestPlan:
     revolutions: float | None
     velocity_rpm: float
     mode: str
+    test_type: str
+    wheel_side: str
     direction_label: str
     direction_sign: int
     duration_seconds: float | None
@@ -47,6 +74,9 @@ class TelemetrySample:
     effort_nm: float
     voltage_v: float
     current_a: float
+    accel_x_raw_m_s2: float
+    accel_x_m_s2: float
+    accel_y_m_s2: float
     winding_temperature_c: float
 
 
@@ -58,11 +88,15 @@ def build_test_plan(
 ) -> TestPlan:
     if velocity_rpm <= 0:
         raise ValueError("Velocity must be greater than 0 rpm.")
-    if mode not in MODE_TO_DIRECTION:
+    if mode not in MODE_CONFIG:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    direction_label, direction_sign = MODE_TO_DIRECTION[mode]
-    uses_stopwatch = mode == "Deployment"
+    mode_config = MODE_CONFIG[mode]
+    direction_label = str(mode_config["direction_label"])
+    direction_sign = int(mode_config["direction_sign"])
+    test_type = str(mode_config["test_type"])
+    wheel_side = str(mode_config["wheel_side"])
+    uses_stopwatch = test_type == "Deployment"
     if uses_stopwatch:
         target_revolutions = None
         duration_seconds = None
@@ -78,6 +112,8 @@ def build_test_plan(
         revolutions=target_revolutions,
         velocity_rpm=velocity_rpm,
         mode=mode,
+        test_type=test_type,
+        wheel_side=wheel_side,
         direction_label=direction_label,
         direction_sign=direction_sign,
         duration_seconds=duration_seconds,
@@ -209,6 +245,8 @@ class HebiWheelService:
 
         raw_position = _first_value(feedback.position)
         self._last_raw_position_rad = raw_position
+        accel_x_raw = _vector_component(getattr(feedback, "accelerometer", None), 0)
+        accel_y = _vector_component(getattr(feedback, "accelerometer", None), 1)
 
         return TelemetrySample(
             elapsed_seconds=elapsed_seconds,
@@ -217,6 +255,10 @@ class HebiWheelService:
             effort_nm=_first_value(feedback.effort),
             voltage_v=_first_value(feedback.voltage),
             current_a=_first_value(getattr(feedback, "motor_current", None)),
+            accel_x_raw_m_s2=accel_x_raw,
+            # On the rover, the accelerometer X axis is aligned with gravity.
+            accel_x_m_s2=accel_x_raw - GRAVITY_M_S2,
+            accel_y_m_s2=accel_y,
             winding_temperature_c=_first_value(getattr(feedback, "motor_winding_temperature", None)),
         )
 
@@ -225,6 +267,8 @@ class HebiWheelService:
         progress = min(1.0, elapsed_seconds / plan.duration_seconds) if plan.duration_seconds else 0.0
         raw_position = signed_velocity * elapsed_seconds
         self._last_raw_position_rad = raw_position
+        accel_x_raw = GRAVITY_M_S2 + 0.15 * math.sin(elapsed_seconds * 2.0)
+        accel_y = 0.25 * math.cos(elapsed_seconds * 1.5)
         return TelemetrySample(
             elapsed_seconds=elapsed_seconds,
             position_rad=raw_position - self._zero_position_rad,
@@ -232,6 +276,9 @@ class HebiWheelService:
             effort_nm=0.8 + abs(signed_velocity) * 0.05,
             voltage_v=48.0 - (progress * 0.5),
             current_a=1.2 + abs(signed_velocity) * 0.08,
+            accel_x_raw_m_s2=accel_x_raw,
+            accel_x_m_s2=accel_x_raw - GRAVITY_M_S2,
+            accel_y_m_s2=accel_y,
             winding_temperature_c=28.0 + (progress * 6.0),
         )
 
@@ -250,3 +297,14 @@ def _first_value(raw: Any) -> float:
             return 0.0
         return float(raw[0])
     return float(raw)
+
+
+def _vector_component(raw: Any, index: int) -> float:
+    if raw is None:
+        return 0.0
+    try:
+        if hasattr(raw, "__len__") and len(raw) > 0 and hasattr(raw[0], "__len__"):
+            return float(raw[0][index])
+        return float(raw[index])
+    except (IndexError, TypeError, ValueError):
+        return 0.0
