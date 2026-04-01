@@ -46,6 +46,7 @@ class TelemetrySample:
     velocity_rad_s: float
     effort_nm: float
     voltage_v: float
+    current_a: float
     winding_temperature_c: float
 
 
@@ -165,6 +166,8 @@ class HebiWheelService:
         if not self.is_connected or self._group is None or self._command is None:
             return False
 
+        # HEBI commands expire after command_lifetime, so the velocity command
+        # must be refreshed repeatedly while the test is running.
         return self._send_velocity_command(plan)
 
     def _send_velocity_command(self, plan: TestPlan) -> bool:
@@ -213,6 +216,7 @@ class HebiWheelService:
             velocity_rad_s=_first_value(feedback.velocity),
             effort_nm=_first_value(feedback.effort),
             voltage_v=_first_value(feedback.voltage),
+            current_a=_first_value(getattr(feedback, "motor_current", None)),
             winding_temperature_c=_first_value(getattr(feedback, "motor_winding_temperature", None)),
         )
 
@@ -227,6 +231,7 @@ class HebiWheelService:
             velocity_rad_s=signed_velocity,
             effort_nm=0.8 + abs(signed_velocity) * 0.05,
             voltage_v=48.0 - (progress * 0.5),
+            current_a=1.2 + abs(signed_velocity) * 0.08,
             winding_temperature_c=28.0 + (progress * 6.0),
         )
 

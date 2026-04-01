@@ -174,6 +174,11 @@ class SingleWheelTestPage(QWidget):
         self._csv_writer = None
         self._current_data_path: Path | None = None
         self._zero_move_started_at: float | None = None
+        
+        # Deployment samples are buffered in memory because the CSV is exported
+        
+        # only after the operator enters the collected mass.
+
         self._pending_deployment_plan: TestPlan | None = None
         self._pending_deployment_samples: list[TelemetrySample] = []
 
@@ -225,13 +230,13 @@ class SingleWheelTestPage(QWidget):
         self.revolutions_input = QDoubleSpinBox()
         self.revolutions_input.setRange(0.1, 10000.0)
         self.revolutions_input.setDecimals(2)
-        self.revolutions_input.setValue(5.0)
+        self.revolutions_input.setValue(2.0)
         self.revolutions_input.setSuffix(" rev")
 
         self.velocity_input = QDoubleSpinBox()
         self.velocity_input.setRange(0.1, 5000.0)
         self.velocity_input.setDecimals(2)
-        self.velocity_input.setValue(30.0)
+        self.velocity_input.setValue(14.0) #Max velocity for the first prototype at 35V 5A is around 15 rpm, so 14 rpm gives a little headroom for testing.
         self.velocity_input.setSuffix(" rpm")
 
         self.mode_input = QComboBox()
@@ -350,6 +355,7 @@ class SingleWheelTestPage(QWidget):
             ("Velocity", "velocity"),
             ("Effort", "effort"),
             ("Voltage", "voltage"),
+            ("Current", "current"),
             ("Winding Temp", "temperature"),
         ]
         for row, (label_text, key) in enumerate(fields):
@@ -494,6 +500,10 @@ class SingleWheelTestPage(QWidget):
         if success:
             self._append_log(message)
             if self.hebi_service.is_connected:
+
+                # The zero-position command is also refreshed for a short time,
+                # otherwise the actuator may not have enough time to reach 0 rad.
+
                 self._zero_move_started_at = time.monotonic()
                 self.zero_button.setEnabled(False)
                 self.execution_label.setText("Moving actuator to 0.000 rad...")
@@ -535,7 +545,7 @@ class SingleWheelTestPage(QWidget):
         if self._running_in_preview:
             sample = self.hebi_service.preview_feedback(self._current_plan, elapsed)
         else:
-            self.hebi_service.refresh_velocity_command(self._current_plan)
+            self.hebi_service.refresh_velocity_command(self._current_plan) # Refresh the command continuously while the wheel is spinning.
             sample = self.hebi_service.read_feedback(elapsed)
             if sample is None:
                 sample = self.hebi_service.preview_feedback(self._current_plan, elapsed)
@@ -591,6 +601,7 @@ class SingleWheelTestPage(QWidget):
         self.telemetry_labels["velocity"].setText(f"{sample.velocity_rad_s:.3f} rad/s")
         self.telemetry_labels["effort"].setText(f"{sample.effort_nm:.3f} Nm")
         self.telemetry_labels["voltage"].setText(f"{sample.voltage_v:.2f} V")
+        self.telemetry_labels["current"].setText(f"{sample.current_a:.3f} A")
         self.telemetry_labels["temperature"].setText(f"{sample.winding_temperature_c:.2f} C")
 
     def _prepare_test_storage(self, plan: TestPlan) -> None:
@@ -622,6 +633,8 @@ class SingleWheelTestPage(QWidget):
                 "velocity_rad_s",
                 "effort_nm",
                 "voltage_v",
+                "current_a",
+                "power_w",
                 "winding_temperature_c",
             ]
         )
@@ -640,6 +653,7 @@ class SingleWheelTestPage(QWidget):
                     velocity_rad_s=sample.velocity_rad_s,
                     effort_nm=sample.effort_nm,
                     voltage_v=sample.voltage_v,
+                    current_a=sample.current_a,
                     winding_temperature_c=sample.winding_temperature_c,
                 )
             )
@@ -658,6 +672,8 @@ class SingleWheelTestPage(QWidget):
                 f"{sample.velocity_rad_s:.6f}",
                 f"{sample.effort_nm:.6f}",
                 f"{sample.voltage_v:.6f}",
+                f"{sample.current_a:.6f}",
+                f"{self._power_w(sample):.6f}",
                 f"{sample.winding_temperature_c:.6f}",
             ]
         )
@@ -687,6 +703,8 @@ class SingleWheelTestPage(QWidget):
                     "velocity_rad_s",
                     "effort_nm",
                     "voltage_v",
+                    "current_a",
+                    "power_w",
                     "winding_temperature_c",
                 ]
             )
@@ -701,6 +719,8 @@ class SingleWheelTestPage(QWidget):
                         f"{sample.velocity_rad_s:.6f}",
                         f"{sample.effort_nm:.6f}",
                         f"{sample.voltage_v:.6f}",
+                        f"{sample.current_a:.6f}",
+                        f"{self._power_w(sample):.6f}",
                         f"{sample.winding_temperature_c:.6f}",
                     ]
                 )
@@ -736,6 +756,9 @@ class SingleWheelTestPage(QWidget):
         if not active_plan.uses_stopwatch:
             return 0.0
         return self.mass_input.value()
+
+    def _power_w(self, sample: TelemetrySample) -> float:
+        return sample.voltage_v * sample.current_a
 
 
 class MainWindow(QMainWindow):
