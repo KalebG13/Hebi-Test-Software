@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
-from PySide6.QtCore import QLocale, Qt, QTimer, Signal
+from PySide6.QtCore import QLocale, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -53,6 +54,23 @@ LAB_CHECKLIST_ITEMS = [
 #Delay durations for the pre-roll and post-roll phases, which capture data before the wheel starts moving and after it stops so the CSV includes the baseline and settling behavior.
 PRE_ROLL_SECONDS = 1.0
 POST_ROLL_SECONDS = 1.0
+TEST_DEFINITION_LABEL_WIDTH = 190
+DEFAULT_TEST_NUMBER = 1
+DEFAULT_REVOLUTIONS = 2.0
+DEFAULT_VELOCITY_RPM = 14.0
+
+
+def _app_base_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _resource_directory() -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root is not None:
+        return Path(bundle_root)
+    return _app_base_directory()
 
 
 class ProgressBar(QFrame):
@@ -147,7 +165,7 @@ class WheelChoicePage(QWidget):
         self._update_responsive_layout()
 
     def _load_logo_pixmap(self) -> QPixmap | None:
-        figures_dir = Path(__file__).resolve().parent.parent / "fig"
+        figures_dir = _resource_directory() / "fig"
         for file_name in ("srl_logo.jpg", "srl_logo.png", "slr_logo.png"):
             logo_path = figures_dir / file_name
             if not logo_path.exists():
@@ -204,6 +222,7 @@ class WheelChoicePage(QWidget):
 
 class SingleWheelTestPage(QWidget):
     back_requested = Signal()
+    change_output_directory_requested = Signal()
 
     def __init__(self, hebi_service: HebiWheelService) -> None:
         super().__init__()
@@ -225,6 +244,7 @@ class SingleWheelTestPage(QWidget):
         self._motion_started_at: float | None = None
         self._post_roll_started_at: float | None = None
         self._motion_elapsed_before_post_roll = 0.0
+        self._output_directory: Path | None = None
 
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(100)
@@ -271,6 +291,11 @@ class SingleWheelTestPage(QWidget):
         self._refresh_available_motors()
         self._update_responsive_layout()
 
+    def _fixed_form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setFixedWidth(TEST_DEFINITION_LABEL_WIDTH)
+        return label
+
     def _build_configuration_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -315,19 +340,20 @@ class SingleWheelTestPage(QWidget):
         self.mass_input.setSuffix(" kg")
         self.mass_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.mass_label = QLabel("Collected Mass")
+        self.mass_label.setFixedWidth(TEST_DEFINITION_LABEL_WIDTH)
 
         self.revolutions_input.valueChanged.connect(self._update_derived_fields)
         self.velocity_input.valueChanged.connect(self._update_derived_fields)
         self.mode_input.currentTextChanged.connect(self._update_derived_fields)
 
-        form.addRow("Test Number", self.test_number_input)
-        form.addRow("Revolutions", self.revolutions_input)
-        form.addRow("Velocity", self.velocity_input)
-        form.addRow("Mode", self.mode_input)
-        form.addRow("Direction", self.direction_label)
-        form.addRow("Estimated Time", self.duration_label)
-        form.addRow("Velocity (rad/s)", self.velocity_rad_label)
-        form.addRow("File Prefix", self.file_prefix_input)
+        form.addRow(self._fixed_form_label("Test Number"), self.test_number_input)
+        form.addRow(self._fixed_form_label("Revolutions"), self.revolutions_input)
+        form.addRow(self._fixed_form_label("Velocity"), self.velocity_input)
+        form.addRow(self._fixed_form_label("Mode"), self.mode_input)
+        form.addRow(self._fixed_form_label("Direction"), self.direction_label)
+        form.addRow(self._fixed_form_label("Estimated Time"), self.duration_label)
+        form.addRow(self._fixed_form_label("Velocity (rad/s)"), self.velocity_rad_label)
+        form.addRow(self._fixed_form_label("File Prefix"), self.file_prefix_input)
         form.addRow(self.mass_label, self.mass_input)
 
         hebi_box = QGroupBox("HEBI Connection")
@@ -365,10 +391,16 @@ class SingleWheelTestPage(QWidget):
         self.export_button = QPushButton("Export Deployment CSV")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._export_pending_deployment_data)
+        self.change_output_directory_button = QPushButton("Change Save Folder")
+        self.change_output_directory_button.clicked.connect(self.change_output_directory_requested.emit)
+        self.reset_button = QPushButton("Reset Interface")
+        self.reset_button.clicked.connect(self._reset_interface)
         actions.addWidget(self.start_button)
         actions.addWidget(self.stop_button)
         actions.addWidget(self.zero_button)
         actions.addWidget(self.export_button)
+        actions.addWidget(self.change_output_directory_button)
+        actions.addWidget(self.reset_button)
 
         panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout.addWidget(test_box)
@@ -516,7 +548,7 @@ class SingleWheelTestPage(QWidget):
             self.mass_label.setText("Collected Mass")
         else:
             self.duration_label.setText(f"{plan.duration_seconds:.2f} s")
-            self.mass_label.setText("Collected Mass (deployment only)")
+            self.mass_label.setText("Collected Mass(deployment only)")
         self.velocity_rad_label.setText(f"{plan.velocity_rad_s:.3f} rad/s")
 
     def _refresh_available_motors(self) -> None:
@@ -533,6 +565,11 @@ class SingleWheelTestPage(QWidget):
             self.motor_selector.addItem(label, module)
 
         self._append_log(f"Discovered {len(modules)} motor(s) on the network.")
+
+    def set_output_directory(self, output_directory: Path) -> None:
+        self._output_directory = output_directory
+        self.data_file_label.setText(self._data_file_status_text())
+        self._append_log(f"Data will be saved under {self._output_root()}")
 
     def _connect_hebi(self) -> None:
         selected_module = self.motor_selector.currentData()
@@ -791,7 +828,7 @@ class SingleWheelTestPage(QWidget):
         if abandoned_path is not None and abandoned_path.exists():
             abandoned_path.unlink()
         self._current_data_path = None
-        self.data_file_label.setText("No data file created yet.")
+        self.data_file_label.setText(self._data_file_status_text())
         self._pending_deployment_plan = None
         self._pending_deployment_samples = []
         self._current_plan = None
@@ -802,6 +839,67 @@ class SingleWheelTestPage(QWidget):
         self._pending_finish_message = ""
         self._motion_elapsed_before_post_roll = 0.0
         QMessageBox.warning(self, title, message)
+
+    def _reset_interface(self) -> None:
+        if self.poll_timer.isActive():
+            QMessageBox.warning(self, "Reset interface", "Stop the current test before resetting the interface.")
+            return
+        if self.zero_timer.isActive():
+            QMessageBox.warning(
+                self,
+                "Reset interface",
+                "Wait for the move-to-zero action to finish before resetting the interface.",
+            )
+            return
+        if self._pending_deployment_plan is not None:
+            discard = QMessageBox.question(
+                self,
+                "Reset interface",
+                "There is pending deployment data that has not been exported. Discard it and reset the interface?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if discard != QMessageBox.Yes:
+                return
+
+        self.hebi_service.stop()
+        self._close_data_file()
+        self._current_plan = None
+        self._test_started_at = None
+        self._running_in_preview = False
+        self._current_data_path = None
+        self._zero_move_started_at = None
+        self._pending_deployment_plan = None
+        self._pending_deployment_samples = []
+        self._test_phase = "idle"
+        self._pending_finish_message = ""
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
+
+        self.test_number_input.setValue(1)
+        self.revolutions_input.setValue(2.0)
+        self.velocity_input.setValue(14.0)
+        self.mode_input.setCurrentIndex(0)
+        self.file_prefix_input.clear()
+        self._reset_checklist()
+        self._reset_charts()
+        self.log_output.clear()
+        for label in self.telemetry_labels.values():
+            label.setText("--")
+
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.connect_button.setEnabled(True)
+        self.refresh_motors_button.setEnabled(True)
+        self.zero_button.setEnabled(True)
+        self.export_button.setEnabled(False)
+        self.progress_bar.set_value(0)
+        self.progress_text.setText("Ready")
+        self.execution_label.setText("Waiting for a test to start.")
+        self.data_file_label.setText(self._data_file_status_text())
+        self._update_derived_fields()
+        self._append_log("Interface reset. Ready for a new excavation/deployment sequence.")
 
     def _sample_for_phase(self, elapsed: float) -> TelemetrySample:
         if self._current_plan is None:
@@ -936,7 +1034,9 @@ class SingleWheelTestPage(QWidget):
             self._pending_deployment_samples = []
             self._current_data_path = None
             self._close_data_file()
-            self.data_file_label.setText("Deployment data will be exported after you enter the mass.")
+            self.data_file_label.setText(
+                f"Deployment data will be exported under {self._data_directory_for_plan(plan)} after you enter the mass."
+            )
             return
 
         self._open_data_file(plan)
@@ -944,7 +1044,7 @@ class SingleWheelTestPage(QWidget):
     def _open_data_file(self, plan: TestPlan) -> None:
         self._close_data_file()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(__file__).resolve().parent.parent / "data" / plan.test_type.lower()
+        output_dir = self._data_directory_for_plan(plan)
         output_dir.mkdir(parents=True, exist_ok=True)
         prefix = self._file_prefix()
         file_path = output_dir / f"{prefix}_test{plan.test_number:03d}_{timestamp}.csv"
@@ -1033,7 +1133,7 @@ class SingleWheelTestPage(QWidget):
             return
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(__file__).resolve().parent.parent / "data" / plan.test_type.lower()
+        output_dir = self._data_directory_for_plan(plan)
         output_dir.mkdir(parents=True, exist_ok=True)
         prefix = self._file_prefix()
         file_path = output_dir / f"{prefix}_test{plan.test_number:03d}_{timestamp}.csv"
@@ -1102,6 +1202,17 @@ class SingleWheelTestPage(QWidget):
             checkbox.setChecked(False)
         self.mass_input.setValue(0.0)
 
+    def _output_root(self) -> Path:
+        if self._output_directory is not None:
+            return self._output_directory
+        return _app_base_directory() / "data"
+
+    def _data_directory_for_plan(self, plan: TestPlan) -> Path:
+        return self._output_root() / plan.test_type.lower()
+
+    def _data_file_status_text(self) -> str:
+        return f"Output folder: {self._output_root()}"
+
     def _file_prefix(self) -> str:
         raw_prefix = self.file_prefix_input.text().strip()
         cleaned = raw_prefix.replace(" ", "_")
@@ -1130,23 +1241,68 @@ class MainWindow(QMainWindow):
         self.resize(1160, 760)
 
         self.hebi_service = HebiWheelService()
+        self.settings = QSettings("Space Robotics Lab", "Wheel Test UI")
+        self.output_directory: Path | None = None
 
         self.stack = QStackedWidget()
         self.choice_page = WheelChoicePage()
         self.single_wheel_page = SingleWheelTestPage(self.hebi_service)
         self.choice_page.single_wheel_selected.connect(self._open_single_wheel)
         self.single_wheel_page.back_requested.connect(self._open_choice)
+        self.single_wheel_page.change_output_directory_requested.connect(self._change_output_directory)
 
         self.stack.addWidget(self.choice_page)
         self.stack.addWidget(self.single_wheel_page)
         self.setCentralWidget(self.stack)
         self._apply_styles()
+        self._load_saved_output_directory()
 
     def _open_choice(self) -> None:
         self.stack.setCurrentWidget(self.choice_page)
 
     def _open_single_wheel(self) -> None:
+        if self.output_directory is None and not self._choose_output_directory():
+            return
         self.stack.setCurrentWidget(self.single_wheel_page)
+
+    def _load_saved_output_directory(self) -> None:
+        saved_directory = self.settings.value("output_directory", "", str)
+        if not saved_directory:
+            return
+
+        candidate = Path(saved_directory)
+        if not candidate.exists():
+            return
+
+        self.output_directory = candidate
+        self.single_wheel_page.set_output_directory(candidate)
+
+    def _choose_output_directory(self) -> bool:
+        default_directory = str(Path.home())
+        if self.output_directory is not None:
+            default_directory = str(self.output_directory)
+
+        selected_directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose the folder where test data will be saved",
+            default_directory,
+        )
+        if not selected_directory:
+            QMessageBox.information(
+                self,
+                "Output folder required",
+                "Choose an output folder before opening the single-wheel test screen.",
+            )
+            return False
+
+        target = Path(selected_directory)
+        self.output_directory = target
+        self.settings.setValue("output_directory", str(target))
+        self.single_wheel_page.set_output_directory(target)
+        return True
+
+    def _change_output_directory(self) -> None:
+        self._choose_output_directory()
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(

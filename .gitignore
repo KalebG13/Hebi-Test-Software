@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 check.py
+build/
+dist/
+wheel_test_ui.spec
+data/
