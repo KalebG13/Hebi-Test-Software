@@ -206,9 +206,25 @@ class HebiWheelService:
         # must be refreshed repeatedly while the test is running.
         return self._send_velocity_command(plan)
 
+    def set_signed_velocity(self, signed_velocity_rad_s: float) -> tuple[bool, str]:
+        if not self.is_connected or self._group is None or self._command is None:
+            return False, "No HEBI actuator connected."
+
+        if not self._send_raw_velocity_command(signed_velocity_rad_s):
+            return False, "Failed to send the wheel velocity command."
+        return True, "Wheel command sent to HEBI actuator."
+
+    def refresh_signed_velocity(self, signed_velocity_rad_s: float) -> bool:
+        if not self.is_connected or self._group is None or self._command is None:
+            return False
+        return self._send_raw_velocity_command(signed_velocity_rad_s)
+
     def _send_velocity_command(self, plan: TestPlan) -> bool:
+        return self._send_raw_velocity_command(plan.direction_sign * plan.velocity_rad_s)
+
+    def _send_raw_velocity_command(self, signed_velocity_rad_s: float) -> bool:
         self._command.clear()
-        self._command.velocity = [plan.direction_sign * plan.velocity_rad_s]
+        self._command.velocity = [signed_velocity_rad_s]
         return self._group.send_command(self._command)
 
     def zero_position(self) -> tuple[bool, str]:
@@ -227,6 +243,20 @@ class HebiWheelService:
         if not self.is_connected or self._group is None or self._command is None:
             return False
         return self._send_position_command(0.0)
+
+    def move_to_position(self, target_position_rad: float) -> tuple[bool, str]:
+        if not self.is_connected or self._group is None or self._command is None:
+            return False, "No HEBI actuator connected."
+
+        sent = self._send_position_command(target_position_rad)
+        if sent:
+            return True, f"Actuator commanded to move to {target_position_rad:.3f} rad."
+        return False, f"Failed to send the {target_position_rad:.3f} rad position command."
+
+    def refresh_position_command(self, target_position_rad: float) -> bool:
+        if not self.is_connected or self._group is None or self._command is None:
+            return False
+        return self._send_position_command(target_position_rad)
 
     def stop(self) -> None:
         if not self.is_connected or self._group is None or self._command is None:

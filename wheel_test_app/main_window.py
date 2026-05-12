@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import sys
 import time
 from pathlib import Path
@@ -51,6 +52,13 @@ LAB_CHECKLIST_ITEMS = [
     "Picture after Ex.",
     "Picture after Dep.",
 ]
+TWO_WHEEL_CHECKLIST_ITEMS = [
+    "Camera On",
+    "Picture Before Mov",
+    "Picture After Mov",
+    "Optitrack",
+    "Position in 0 rad",
+]
 #Delay durations for the pre-roll and post-roll phases, which capture data before the wheel starts moving and after it stops so the CSV includes the baseline and settling behavior.
 PRE_ROLL_SECONDS = 1.0
 POST_ROLL_SECONDS = 1.0
@@ -58,6 +66,10 @@ TEST_DEFINITION_LABEL_WIDTH = 190
 DEFAULT_TEST_NUMBER = 1
 DEFAULT_REVOLUTIONS = 2.0
 DEFAULT_VELOCITY_RPM = 14.0
+TWO_WHEEL_DEPLOYMENT_RPM = 14.0
+TWO_WHEEL_WIGGLE_TARGET_RAD = 0.35
+TWO_WHEEL_WIGGLE_HOLD_SECONDS = 1.0
+TWO_WHEEL_WIGGLE_TIMEOUT_SECONDS = 4.0
 
 
 def _app_base_directory() -> Path:
@@ -105,6 +117,7 @@ class ProgressBar(QFrame):
 
 class WheelChoicePage(QWidget):
     single_wheel_selected = Signal()
+    two_wheel_selected = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -145,10 +158,10 @@ class WheelChoicePage(QWidget):
 
         two_wheel_card, two_wheel_button = self._build_card(
             title="2 Wheels",
-            description="Reserved for the dual-wheel workflow. The screen is not implemented yet.",
-            button_text="Coming Soon",
+            description="Reserved for the dual-wheel workflow.",
+            button_text="Open Dual Wheel Test",
         )
-        two_wheel_button.setEnabled(False)
+        two_wheel_button.clicked.connect(self.two_wheel_selected.emit)
 
         self.cards_layout.addWidget(one_wheel_card)
         self.cards_layout.addWidget(two_wheel_card)
@@ -1234,6 +1247,1099 @@ class SingleWheelTestPage(QWidget):
         return sample.voltage_v * sample.current_a
 
 
+class TwoWheelRoverDiagram(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._direction = "Clockwise"
+        self._active_side: str | None = None
+        self._rotation_angle = 0.0
+        self._animation_timer = QTimer(self)
+        self._animation_timer.setInterval(70)
+        self._animation_timer.timeout.connect(self._advance_animation)
+        self.setMinimumHeight(150)
+        self.setMaximumHeight(180)
+
+    def set_direction(self, direction: str) -> None:
+        self._direction = direction
+        self.update()
+
+    def set_active_side(self, side: str | None) -> None:
+        self._active_side = side
+        if side is None:
+            self._animation_timer.stop()
+            self._rotation_angle = 0.0
+        elif not self._animation_timer.isActive():
+            self._animation_timer.start()
+        self.update()
+
+    def _advance_animation(self) -> None:
+        direction = -1.0 if self._direction == "Clockwise" else 1.0
+        self._rotation_angle = (self._rotation_angle + direction * 18.0) % 360.0
+        self.update()
+
+    def _role_for_side(self, side: str) -> str:
+        if self._direction == "Clockwise":
+            return "Front" if side == "right" else "Rear"
+        return "Front" if side == "left" else "Rear"
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QColor, QPainter, QPen
+
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        body_width = min(width * 0.58, 380.0)
+        body_height = min(height * 0.25, 54.0)
+        body_x = (width - body_width) / 2.0
+        body_y = height * 0.33
+        wheel_size = min(body_width * 0.24, height * 0.32, 70.0)
+        left_wheel = QRectF(body_x + body_width * 0.05, body_y + body_height * 0.55, wheel_size, wheel_size)
+        right_wheel = QRectF(body_x + body_width * 0.70, body_y + body_height * 0.55, wheel_size, wheel_size)
+
+        painter.setPen(QPen(QColor("#35312b"), 3))
+        painter.setBrush(QColor("#f7f2e7"))
+        painter.drawRoundedRect(QRectF(body_x, body_y, body_width, body_height), 10, 10)
+        painter.drawLine(
+            int(body_x + body_width * 0.22),
+            int(body_y + body_height),
+            int(body_x + body_width * 0.22),
+            int(left_wheel.top()),
+        )
+        painter.drawLine(
+            int(body_x + body_width * 0.78),
+            int(body_y + body_height),
+            int(body_x + body_width * 0.78),
+            int(right_wheel.top()),
+        )
+
+        self._draw_wheel(painter, left_wheel, "left", "Left", self._role_for_side("left"))
+        self._draw_wheel(painter, right_wheel, "right", "Right", self._role_for_side("right"))
+
+        painter.setPen(QColor("#9f2539"))
+        painter.drawText(
+            QRectF(body_x, body_y - 32, body_width, 24),
+            Qt.AlignCenter,
+            f"Direction: {self._direction}",
+        )
+        painter.end()
+
+    def _draw_wheel(self, painter, rect, side: str, side_label: str, role_label: str) -> None:
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QColor, QPen
+
+        active = self._active_side in {side, "both"}
+        if active:
+            glow_rect = QRectF(rect)
+            glow_rect.adjust(-8, -8, 8, 8)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(159, 37, 57, 70))
+            painter.drawEllipse(glow_rect)
+
+        painter.setPen(QPen(QColor("#2f2f2f"), 4))
+        painter.setBrush(QColor("#3d3d3d"))
+        painter.drawEllipse(rect)
+
+        painter.setPen(QPen(QColor("#f1f1f1"), 6))
+        center = rect.center()
+        spoke_radius = rect.width() * 0.34
+        for angle_offset in (0.0, 90.0):
+            angle = math.radians(self._rotation_angle + angle_offset)
+            dx = math.cos(angle) * spoke_radius
+            dy = math.sin(angle) * spoke_radius
+            painter.drawLine(
+                int(center.x() - dx),
+                int(center.y() - dy),
+                int(center.x() + dx),
+                int(center.y() + dy),
+            )
+
+        painter.setPen(QColor("#1c1c1c"))
+        label_rect = QRectF(rect.left() - 20, rect.bottom() + 8, rect.width() + 40, 42)
+        painter.drawText(label_rect, Qt.AlignCenter, f"{side_label}\n{role_label}")
+
+
+class TwoWheelTestPage(QWidget):
+    back_requested = Signal()
+    change_output_directory_requested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.left_service = HebiWheelService()
+        self.right_service = HebiWheelService()
+        self.services = {"left": self.left_service, "right": self.right_service}
+
+        self._output_directory: Path | None = None
+        self._available_modules: list[DiscoveredModule] = []
+        self._connected_modules: dict[str, DiscoveredModule] = {}
+        self._main_samples: dict[str, list[TelemetrySample]] = {"left": [], "right": []}
+        self._main_started_at: float | None = None
+        self._main_timestamp = ""
+        self._has_pending_export = False
+        self._is_main_running = False
+        self._main_phase = "idle"
+        self._motion_started_at: float | None = None
+        self._post_roll_started_at: float | None = None
+        self._motion_elapsed_before_post_roll = 0.0
+        self._pending_finish_message = ""
+        self._deployment_side: str | None = None
+        self._wiggle_side: str | None = None
+        self._wiggle_phase = "idle"
+        self._wiggle_started_at: float | None = None
+        self._zero_started_at: float | None = None
+        self._max_chart_points = 300
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(100)
+        self.poll_timer.timeout.connect(self._poll_active_motion)
+        self.wiggle_timer = QTimer(self)
+        self.wiggle_timer.setInterval(100)
+        self.wiggle_timer.timeout.connect(self._poll_wiggle)
+        self.zero_timer = QTimer(self)
+        self.zero_timer.setInterval(100)
+        self.zero_timer.timeout.connect(self._poll_zero_all)
+
+        self.motor_selectors: dict[str, QComboBox] = {}
+        self.status_labels: dict[str, QLabel] = {}
+        self.velocity_inputs: dict[str, QDoubleSpinBox] = {}
+        self.mass_inputs: dict[str, QDoubleSpinBox] = {}
+        self.connect_buttons: dict[str, QPushButton] = {}
+        self.wiggle_buttons: dict[str, QPushButton] = {}
+        self.deployment_buttons: dict[str, QPushButton] = {}
+        self.telemetry_labels_by_side: dict[str, dict[str, QLabel]] = {}
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+
+        content_widget = QWidget()
+        root = QVBoxLayout(content_widget)
+        root.setContentsMargins(28, 28, 28, 28)
+        root.setSpacing(20)
+
+        toolbar = QHBoxLayout()
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self.back_requested.emit)
+        header = QLabel("Dual Wheel Test")
+        header.setObjectName("PageTitle")
+        toolbar.addWidget(self.back_button, 0, Qt.AlignLeft)
+        toolbar.addWidget(header, 0, Qt.AlignVCenter)
+        toolbar.addStretch(1)
+
+        root.addLayout(toolbar)
+        root.addWidget(self._build_general_panel())
+        root.addWidget(self._build_visual_panel())
+
+        wheels_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        wheels_layout.setSpacing(20)
+        wheels_layout.addWidget(self._build_wheel_panel("left", "Left Wheel"), 1)
+        wheels_layout.addWidget(self._build_wheel_panel("right", "Right Wheel"), 1)
+        root.addLayout(wheels_layout)
+        root.addWidget(self._build_graph_panel(), 1)
+
+        self.log_output = QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setPlaceholderText("Dual-wheel test messages will appear here.")
+        self.log_output.setMaximumHeight(110)
+        root.addWidget(self.log_output)
+
+        scroll_area.setWidget(content_widget)
+        outer_layout.addWidget(scroll_area)
+
+        self._set_motor_selector_placeholders()
+        self._update_role_labels()
+        self._update_export_button_state()
+
+    def _build_general_panel(self) -> QGroupBox:
+        box = QGroupBox("General Configuration")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(10)
+        columns = QHBoxLayout()
+        columns.setSpacing(18)
+
+        setup_box = QGroupBox("Test Setup")
+        form = QFormLayout(setup_box)
+        form.setSpacing(12)
+
+        self.test_number_input = QSpinBox()
+        self.test_number_input.setMinimum(1)
+        self.test_number_input.setMaximum(9999)
+        self.test_number_input.setValue(DEFAULT_TEST_NUMBER)
+        self.test_number_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+
+        self.direction_input = QComboBox()
+        self.direction_input.addItems(["Clockwise", "Counter clockwise"])
+        self.direction_input.currentTextChanged.connect(self._update_role_labels)
+
+        self.duration_input = QDoubleSpinBox()
+        self.duration_input.setRange(0.1, 3600.0)
+        self.duration_input.setDecimals(2)
+        self.duration_input.setValue(10.0)
+        self.duration_input.setSuffix(" s")
+        self.duration_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+
+        self.file_prefix_input = QLineEdit()
+        self.file_prefix_input.setPlaceholderText("Example: Dual_Wheel_Test")
+
+        form.addRow("Test Number", self.test_number_input)
+        form.addRow("Direction", self.direction_input)
+        form.addRow("Duration", self.duration_input)
+        form.addRow("File Prefix", self.file_prefix_input)
+
+        columns.addWidget(setup_box, 1)
+        columns.addWidget(self._build_checklist_box(), 1)
+
+        save_row = QWidget()
+        save_layout = QHBoxLayout(save_row)
+        save_layout.setContentsMargins(0, 0, 0, 0)
+        save_layout.setSpacing(10)
+        self.save_folder_label = QLabel(self._data_file_status_text())
+        self.save_folder_label.setWordWrap(True)
+        self.change_output_directory_button = QPushButton("Change Save Folder")
+        self.change_output_directory_button.clicked.connect(self.change_output_directory_requested.emit)
+        save_layout.addWidget(QLabel("Save Folder"))
+        save_layout.addWidget(self.save_folder_label, 1)
+        save_layout.addWidget(self.change_output_directory_button)
+
+        layout.addLayout(columns)
+        layout.addWidget(save_row)
+        return box
+
+    def _build_checklist_box(self) -> QGroupBox:
+        checklist_box = QGroupBox("Laboratory Checklist")
+        checklist_layout = QGridLayout(checklist_box)
+        checklist_layout.setHorizontalSpacing(16)
+        checklist_layout.setVerticalSpacing(8)
+
+        self.checklist_boxes: list[QCheckBox] = []
+        for index, item in enumerate(TWO_WHEEL_CHECKLIST_ITEMS):
+            checkbox = QCheckBox(item)
+            row = index // 2
+            column = index % 2
+            checklist_layout.addWidget(checkbox, row, column)
+            self.checklist_boxes.append(checkbox)
+        return checklist_box
+
+    def _build_visual_panel(self) -> QGroupBox:
+        box = QGroupBox("Wheel Assignment")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(8)
+        self.rover_diagram = TwoWheelRoverDiagram()
+        self.assignment_label = QLabel()
+        self.assignment_label.setAlignment(Qt.AlignCenter)
+        self.assignment_label.setObjectName("StatusLabel")
+        self.progress_bar = ProgressBar()
+        self.progress_text = QLabel("Ready")
+        self.progress_text.setAlignment(Qt.AlignRight)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.refresh_motors_button = QPushButton("Refresh Motors")
+        self.refresh_motors_button.clicked.connect(self._refresh_available_motors)
+        self.start_button = QPushButton("Start")
+        self.start_button.clicked.connect(self._start_main_motion)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self._stop_active_motion)
+        self.zero_button = QPushButton("Set Position to 0 rad")
+        self.zero_button.clicked.connect(self._zero_all)
+        self.export_button = QPushButton("Export CSV")
+        self.export_button.clicked.connect(self._export_csv)
+        self.reset_button = QPushButton("Reset Interface")
+        self.reset_button.clicked.connect(self._reset_interface)
+        actions.addWidget(self.refresh_motors_button)
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.stop_button)
+        actions.addWidget(self.zero_button)
+        actions.addWidget(self.export_button)
+        actions.addWidget(self.reset_button)
+        layout.addWidget(self.rover_diagram)
+        layout.addWidget(self.assignment_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.progress_text)
+        layout.addLayout(actions)
+        return box
+
+    def _build_wheel_panel(self, side: str, title: str) -> QGroupBox:
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        form = QFormLayout()
+        form.setSpacing(12)
+
+        motor_row = QWidget()
+        motor_layout = QHBoxLayout(motor_row)
+        motor_layout.setContentsMargins(0, 0, 0, 0)
+        selector = QComboBox()
+        connect_button = QPushButton("Connect")
+        connect_button.clicked.connect(lambda checked=False, wheel_side=side: self._connect_wheel(wheel_side))
+        motor_layout.addWidget(selector, 1)
+        motor_layout.addWidget(connect_button)
+
+        status_label = QLabel("Disconnected")
+        status_label.setObjectName("StatusLabel")
+
+        velocity_input = QDoubleSpinBox()
+        velocity_input.setRange(0.1, 5000.0)
+        velocity_input.setDecimals(2)
+        velocity_input.setValue(DEFAULT_VELOCITY_RPM)
+        velocity_input.setSuffix(" rpm")
+        velocity_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+
+        mass_input = QDoubleSpinBox()
+        mass_input.setRange(0.0, 1000.0)
+        mass_input.setDecimals(4)
+        mass_input.setValue(0.0)
+        mass_input.setSuffix(" kg")
+        mass_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        mass_input.valueChanged.connect(self._update_export_button_state)
+
+        form.addRow("Motor", motor_row)
+        form.addRow("Status", status_label)
+        form.addRow("Velocity", velocity_input)
+        form.addRow("Collected Mass", mass_input)
+
+        buttons = QHBoxLayout()
+        wiggle_button = QPushButton("Test Wheel")
+        wiggle_button.clicked.connect(lambda checked=False, wheel_side=side: self._start_wiggle(wheel_side))
+        deployment_button = QPushButton("Deployment 14 rpm")
+        deployment_button.clicked.connect(lambda checked=False, wheel_side=side: self._start_deployment(wheel_side))
+        deployment_button.setEnabled(False)
+        buttons.addWidget(wiggle_button)
+        buttons.addWidget(deployment_button)
+
+        self.motor_selectors[side] = selector
+        self.status_labels[side] = status_label
+        self.velocity_inputs[side] = velocity_input
+        self.mass_inputs[side] = mass_input
+        self.connect_buttons[side] = connect_button
+        self.wiggle_buttons[side] = wiggle_button
+        self.deployment_buttons[side] = deployment_button
+        self.telemetry_labels_by_side[side] = {}
+
+        layout.addLayout(form)
+        layout.addLayout(buttons)
+        return box
+
+    def _build_graph_panel(self) -> QGroupBox:
+        box = QGroupBox("Live Graphs")
+        layout = QHBoxLayout(box)
+        layout.setSpacing(12)
+        self.effort_series_by_side, self.effort_chart_view = self._build_dual_chart("Effort vs Time", "Time (s)", "Effort (Nm)")
+        self.power_series_by_side, self.power_chart_view = self._build_dual_chart("Power vs Time", "Time (s)", "Power (W)")
+        layout.addWidget(self.effort_chart_view, 1)
+        layout.addWidget(self.power_chart_view, 1)
+        return box
+
+    def _build_dual_chart(self, title: str, x_title: str, y_title: str) -> tuple[dict[str, QLineSeries], QChartView]:
+        chart = QChart()
+        chart.setTitle(title)
+        chart.legend().setVisible(True)
+        chart.setBackgroundVisible(False)
+        chart.setPlotAreaBackgroundVisible(False)
+
+        axis_x = QValueAxis()
+        axis_x.setTitleText(x_title)
+        axis_x.setRange(0.0, 10.0)
+        axis_x.setLabelFormat("%.1f")
+
+        axis_y = QValueAxis()
+        axis_y.setTitleText(y_title)
+        axis_y.setRange(0.0, 10.0)
+        axis_y.setLabelFormat("%.2f")
+
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+
+        series_by_side: dict[str, QLineSeries] = {}
+        for side, name in (("left", "Left"), ("right", "Right")):
+            series = QLineSeries()
+            series.setName(name)
+            chart.addSeries(series)
+            series.attachAxis(axis_x)
+            series.attachAxis(axis_y)
+            series_by_side[side] = series
+
+        chart_view = QChartView(chart)
+        chart_view.setMinimumHeight(340)
+        return series_by_side, chart_view
+
+    def set_output_directory(self, output_directory: Path) -> None:
+        self._output_directory = output_directory
+        self.save_folder_label.setText(self._data_file_status_text())
+        self._append_log(f"Data will be saved under {self._output_root()}")
+
+    def _refresh_available_motors(self) -> None:
+        self._available_modules = self.left_service.discover_modules()
+        for selector in self.motor_selectors.values():
+            selector.clear()
+            if not self._available_modules:
+                selector.addItem("No motors found on the network", None)
+                continue
+            for module in self._available_modules:
+                stale_suffix = " [stale]" if module.is_stale else ""
+                selector.addItem(f"{module.family} / {module.name}{stale_suffix}", module)
+
+        if self._available_modules:
+            self._append_log(f"Discovered {len(self._available_modules)} motor(s) on the network.")
+        else:
+            self._append_log("No HEBI motors were discovered on the network.")
+
+    def _set_motor_selector_placeholders(self) -> None:
+        for selector in self.motor_selectors.values():
+            selector.clear()
+            selector.addItem("Click Refresh Motors", None)
+
+    def _connect_wheel(self, side: str) -> None:
+        selected_module = self.motor_selectors[side].currentData()
+        if not isinstance(selected_module, DiscoveredModule):
+            QMessageBox.warning(self, "HEBI connection", "No motor is selected.")
+            return
+
+        other_side = "right" if side == "left" else "left"
+        other_module = self._connected_modules.get(other_side)
+        if other_module is not None and self._same_module(selected_module, other_module):
+            QMessageBox.warning(self, "HEBI connection", "Left and right wheels must use different HEBI modules.")
+            return
+
+        success, message = self.services[side].connect(
+            family=selected_module.family,
+            module_name=selected_module.name,
+        )
+        self.status_labels[side].setText("Connected" if success else "Disconnected")
+        if success:
+            self._connected_modules[side] = selected_module
+        else:
+            self._connected_modules.pop(side, None)
+            QMessageBox.warning(self, "HEBI connection", message)
+        self._append_log(f"{side.title()} wheel: {message}")
+
+    def _start_main_motion(self) -> None:
+        if not self._can_start_new_action():
+            return
+        if not self._both_wheels_connected():
+            QMessageBox.warning(self, "Dual-wheel start", "Connect both left and right HEBI motors before starting.")
+            return
+        if not self._file_prefix():
+            QMessageBox.warning(self, "Missing file prefix", "Write a file prefix before starting the test.")
+            return
+        if self._has_pending_export:
+            QMessageBox.warning(self, "Pending export", "Export the current dual-wheel data or reset the interface before starting a new test.")
+            return
+
+        self._main_samples = {"left": [], "right": []}
+        self._main_started_at = time.monotonic()
+        self._main_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self._is_main_running = True
+        self._main_phase = "pre_roll"
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
+        self._pending_finish_message = ""
+        self._has_pending_export = False
+        self.progress_bar.set_value(0)
+        self.progress_text.setText(f"Pre-roll 0.0 / {PRE_ROLL_SECONDS:.1f} s")
+        self._reset_charts()
+
+        self._set_controls_running()
+        self.rover_diagram.set_active_side(None)
+        self._append_log(
+            f"Dual-wheel movement armed. Recording {PRE_ROLL_SECONDS:.1f} s before motion, "
+            f"{self.duration_input.value():.2f} s of motion, and {POST_ROLL_SECONDS:.1f} s after stop."
+        )
+        self.poll_timer.start()
+
+    def _start_deployment(self, side: str) -> None:
+        if not self._can_start_new_action():
+            return
+        if not self.services[side].is_connected:
+            QMessageBox.warning(self, "Deployment", f"Connect the {side} wheel before deployment.")
+            return
+        if not self._has_pending_export:
+            QMessageBox.warning(self, "Deployment", "Run the main two-wheel movement before deployment.")
+            return
+
+        velocity_rad_s = -self._direction_sign() * self._rpm_to_rad_s(TWO_WHEEL_DEPLOYMENT_RPM)
+        success, message = self.services[side].set_signed_velocity(velocity_rad_s)
+        if not success:
+            QMessageBox.warning(self, "Deployment", message)
+            return
+
+        self._deployment_side = side
+        self.rover_diagram.set_active_side(side)
+        self.progress_bar.set_value(0)
+        self.progress_text.setText(f"{side.title()} deployment running")
+        self._set_controls_running()
+        self.stop_button.setEnabled(True)
+        self._append_log(f"{side.title()} deployment started at {TWO_WHEEL_DEPLOYMENT_RPM:.2f} rpm.")
+        self.poll_timer.start()
+
+    def _stop_active_motion(self) -> None:
+        if self._is_main_running:
+            if self._main_phase == "pre_roll":
+                self._cancel_main_motion("Dual-wheel movement cancelled before motion started.")
+            elif self._main_phase == "active":
+                self._begin_main_post_roll("Dual-wheel movement stopped by user.")
+            return
+        if self._deployment_side is not None:
+            self._finish_deployment(f"{self._deployment_side.title()} deployment stopped by user.")
+
+    def _poll_active_motion(self) -> None:
+        if self._main_started_at is None and self._deployment_side is None:
+            return
+
+        if self._is_main_running:
+            elapsed = time.monotonic() - self._main_started_at if self._main_started_at is not None else 0.0
+            if self._main_phase == "pre_roll":
+                self._record_main_samples(elapsed)
+                self.progress_bar.set_value(0)
+                self.progress_text.setText(f"Pre-roll {min(elapsed, PRE_ROLL_SECONDS):.1f} / {PRE_ROLL_SECONDS:.1f} s")
+                if elapsed >= PRE_ROLL_SECONDS:
+                    self._begin_main_motion_phase()
+                return
+
+            if self._main_phase == "active":
+                active_elapsed = 0.0 if self._motion_started_at is None else time.monotonic() - self._motion_started_at
+                self._refresh_main_velocity_commands()
+                self._record_main_samples(elapsed)
+                duration = self.duration_input.value()
+                progress = min(100, int((active_elapsed / duration) * 100))
+                self.progress_bar.set_value(progress)
+                self.progress_text.setText(f"{progress}% | {active_elapsed:.1f} s motion")
+                if active_elapsed >= duration:
+                    self._begin_main_post_roll("Dual-wheel movement completed.")
+                return
+
+            if self._main_phase == "post_roll":
+                post_roll_elapsed = 0.0 if self._post_roll_started_at is None else time.monotonic() - self._post_roll_started_at
+                self._record_main_samples(elapsed)
+                self.progress_bar.set_value(100)
+                self.progress_text.setText(
+                    f"Post-roll {min(post_roll_elapsed, POST_ROLL_SECONDS):.1f} / {POST_ROLL_SECONDS:.1f} s"
+                )
+                if post_roll_elapsed >= POST_ROLL_SECONDS:
+                    self._finish_main_motion(self._pending_finish_message or "Dual-wheel movement completed.")
+                return
+            return
+
+        if self._deployment_side is not None:
+            side = self._deployment_side
+            self.services[side].refresh_signed_velocity(-self._direction_sign() * self._rpm_to_rad_s(TWO_WHEEL_DEPLOYMENT_RPM))
+            sample = self.services[side].read_feedback(0.0)
+            if sample is not None:
+                self._update_wheel_display(side, sample)
+
+    def _begin_main_motion_phase(self) -> None:
+        direction_sign = self._direction_sign()
+        for side in ("left", "right"):
+            velocity_rad_s = direction_sign * self._rpm_to_rad_s(self.velocity_inputs[side].value())
+            success, message = self.services[side].set_signed_velocity(velocity_rad_s)
+            if not success:
+                self._abort_active_motion("Dual-wheel start failed", f"{side.title()} wheel: {message}")
+                return
+
+        self._main_phase = "active"
+        self._motion_started_at = time.monotonic()
+        self.rover_diagram.set_active_side("both")
+        self.progress_bar.set_value(0)
+        self.progress_text.setText("0% | 0.0 s motion")
+        self._append_log(
+            f"Motion phase started for {self.duration_input.value():.2f} s. "
+            f"Direction: {self.direction_input.currentText()}."
+        )
+
+    def _begin_main_post_roll(self, message: str) -> None:
+        if self._main_phase != "active":
+            return
+
+        for service in self.services.values():
+            service.stop()
+        self._main_phase = "post_roll"
+        self._pending_finish_message = message
+        self._post_roll_started_at = time.monotonic()
+        self._motion_elapsed_before_post_roll = (
+            0.0 if self._motion_started_at is None else max(0.0, time.monotonic() - self._motion_started_at)
+        )
+        self.rover_diagram.set_active_side(None)
+        self.stop_button.setEnabled(False)
+        self.progress_bar.set_value(100)
+        self.progress_text.setText(f"Post-roll 0.0 / {POST_ROLL_SECONDS:.1f} s")
+        self._append_log("Motion stopped. Recording 1.0 s of post-test data before closing the test.")
+
+    def _refresh_main_velocity_commands(self) -> None:
+        direction_sign = self._direction_sign()
+        for side in ("left", "right"):
+            velocity_rad_s = direction_sign * self._rpm_to_rad_s(self.velocity_inputs[side].value())
+            self.services[side].refresh_signed_velocity(velocity_rad_s)
+
+    def _record_main_samples(self, elapsed: float) -> None:
+        for side in ("left", "right"):
+            sample = self.services[side].read_feedback(elapsed)
+            if sample is not None:
+                self._main_samples[side].append(sample)
+                self._update_wheel_display(side, sample)
+                self._update_charts(side, sample)
+
+    def _finish_main_motion(self, message: str) -> None:
+        self.poll_timer.stop()
+        for service in self.services.values():
+            service.stop()
+        self._is_main_running = False
+        self._has_pending_export = True
+        self._main_started_at = None
+        self._main_phase = "idle"
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
+        self._pending_finish_message = ""
+        self.rover_diagram.set_active_side(None)
+        self.progress_bar.set_value(100)
+        self.progress_text.setText("Movement captured. Run deployment, enter masses, then export.")
+        for button in self.deployment_buttons.values():
+            button.setEnabled(True)
+        self._set_controls_idle()
+        self._update_export_button_state()
+        self._append_log(message)
+
+    def _cancel_main_motion(self, message: str) -> None:
+        self.poll_timer.stop()
+        for service in self.services.values():
+            service.stop()
+        self._is_main_running = False
+        self._has_pending_export = False
+        self._main_started_at = None
+        self._main_phase = "idle"
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
+        self._pending_finish_message = ""
+        self._main_samples = {"left": [], "right": []}
+        self.rover_diagram.set_active_side(None)
+        self.progress_bar.set_value(0)
+        self.progress_text.setText("Ready")
+        self._set_controls_idle()
+        self._append_log(message)
+
+    def _finish_deployment(self, message: str) -> None:
+        if self._deployment_side is not None:
+            self.services[self._deployment_side].stop()
+        self.poll_timer.stop()
+        self.rover_diagram.set_active_side(None)
+        self._append_log(message)
+        self._deployment_side = None
+        self.progress_text.setText("Deployment stopped. Enter the collected mass.")
+        self._set_controls_idle()
+        self._update_export_button_state()
+
+    def _zero_all(self) -> None:
+        if not self._can_start_new_action():
+            return
+        if not self._both_wheels_connected():
+            QMessageBox.warning(self, "Set Position to 0 rad", "Connect both wheels before commanding both to 0 rad.")
+            return
+
+        for side in ("left", "right"):
+            success, message = self.services[side].zero_position()
+            self._append_log(f"{side.title()} wheel: {message}")
+            if not success:
+                QMessageBox.warning(self, "Set Position to 0 rad", message)
+                return
+
+        self._zero_started_at = time.monotonic()
+        self.progress_text.setText("Moving both actuators to 0.000 rad...")
+        self.rover_diagram.set_active_side("both")
+        self._set_controls_running()
+        self.stop_button.setEnabled(False)
+        self.zero_timer.start()
+
+    def _poll_zero_all(self) -> None:
+        reached = True
+        for side in ("left", "right"):
+            self.services[side].refresh_zero_position_command()
+            sample = self.services[side].read_feedback(0.0)
+            if sample is not None:
+                self._update_wheel_display(side, sample)
+                if abs(sample.position_rad) > 0.05:
+                    reached = False
+            else:
+                reached = False
+
+        elapsed = 0.0 if self._zero_started_at is None else time.monotonic() - self._zero_started_at
+        if reached or elapsed >= 8.0:
+            self.zero_timer.stop()
+            self._zero_started_at = None
+            self.rover_diagram.set_active_side(None)
+            self.progress_text.setText("Both actuators reached 0 rad." if reached else "Move to 0 rad timed out.")
+            self._append_log(self.progress_text.text())
+            self._set_controls_idle()
+
+    def _start_wiggle(self, side: str) -> None:
+        if not self._can_start_new_action():
+            return
+        if not self.services[side].is_connected:
+            QMessageBox.warning(self, "Test wheel", f"Connect the {side} wheel before running the test motion.")
+            return
+
+        success, message = self.services[side].move_to_position(TWO_WHEEL_WIGGLE_TARGET_RAD)
+        if not success:
+            QMessageBox.warning(self, "Test wheel", message)
+            return
+
+        self._wiggle_side = side
+        self._wiggle_phase = "out"
+        self._wiggle_started_at = time.monotonic()
+        self.rover_diagram.set_active_side(side)
+        self.progress_text.setText(f"Testing {side} wheel connection...")
+        self._set_controls_running()
+        self.stop_button.setEnabled(False)
+        self._append_log(f"{side.title()} wheel test motion started.")
+        self.wiggle_timer.start()
+
+    def _poll_wiggle(self) -> None:
+        if self._wiggle_side is None or self._wiggle_started_at is None:
+            return
+
+        side = self._wiggle_side
+        elapsed = time.monotonic() - self._wiggle_started_at
+        target = TWO_WHEEL_WIGGLE_TARGET_RAD if self._wiggle_phase == "out" else 0.0
+        self.services[side].refresh_position_command(target)
+        sample = self.services[side].read_feedback(0.0)
+        if sample is not None:
+            self._update_wheel_display(side, sample)
+
+        if self._wiggle_phase == "out" and elapsed >= TWO_WHEEL_WIGGLE_HOLD_SECONDS:
+            self.services[side].move_to_position(0.0)
+            self._wiggle_phase = "return"
+            self._wiggle_started_at = time.monotonic()
+            return
+
+        if self._wiggle_phase == "return":
+            reached_zero = sample is not None and abs(sample.position_rad) <= 0.05
+            if reached_zero or elapsed >= TWO_WHEEL_WIGGLE_TIMEOUT_SECONDS:
+                self.wiggle_timer.stop()
+                self.services[side].stop()
+                self.rover_diagram.set_active_side(None)
+                self._append_log(f"{side.title()} wheel test motion finished.")
+                self.progress_text.setText("Wheel test motion finished.")
+                self._wiggle_side = None
+                self._wiggle_phase = "idle"
+                self._wiggle_started_at = None
+                self._set_controls_idle()
+
+    def _export_csv(self) -> None:
+        if not self._has_pending_export:
+            QMessageBox.information(self, "Export CSV", "There is no captured dual-wheel movement to export.")
+            return
+        for side in ("left", "right"):
+            if self.mass_inputs[side].value() <= 0.0:
+                QMessageBox.warning(self, "Export CSV", "Enter collected mass for both wheels before exporting.")
+                return
+
+        prefix = self._file_prefix()
+        if not prefix:
+            QMessageBox.warning(self, "Export CSV", "Write a file prefix before exporting.")
+            return
+
+        exported_paths: list[Path] = []
+        for role in ("FrontWheel", "RearWheel"):
+            side = self._side_for_role(role)
+            output_dir = self._output_root() / "two_wheels" / role.lower()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            file_path = output_dir / f"{prefix}_{self._main_timestamp}_{role}.csv"
+            self._write_wheel_csv(file_path, side, role)
+            exported_paths.append(file_path)
+
+        self._has_pending_export = False
+        for button in self.deployment_buttons.values():
+            button.setEnabled(False)
+        self._reset_checklist()
+        self._update_export_button_state()
+        self._append_log("Exported dual-wheel CSV files:")
+        for path in exported_paths:
+            self._append_log(str(path))
+        QMessageBox.information(self, "Export CSV", "Dual-wheel CSV files were exported.")
+
+    def _write_wheel_csv(self, file_path: Path, side: str, role: str) -> None:
+        with file_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    "test_number",
+                    "direction",
+                    "physical_wheel",
+                    "wheel_role",
+                    "collected_mass_kg",
+                    "elapsed_seconds",
+                    "position_rad",
+                    "velocity_rad_s",
+                    "effort_nm",
+                    "voltage_v",
+                    "current_a",
+                    "power_w",
+                    "accel_x_raw_m_s2",
+                    "accel_x_m_s2",
+                    "accel_y_m_s2",
+                    "winding_temperature_c",
+                ]
+            )
+            for sample in self._main_samples[side]:
+                writer.writerow(
+                    [
+                        self.test_number_input.value(),
+                        self.direction_input.currentText(),
+                        side,
+                        role,
+                        f"{self.mass_inputs[side].value():.4f}",
+                        f"{sample.elapsed_seconds:.3f}",
+                        f"{sample.position_rad:.6f}",
+                        f"{sample.velocity_rad_s:.6f}",
+                        f"{sample.effort_nm:.6f}",
+                        f"{sample.voltage_v:.6f}",
+                        f"{sample.current_a:.6f}",
+                        f"{self._power_w(sample):.6f}",
+                        f"{sample.accel_x_raw_m_s2:.6f}",
+                        f"{sample.accel_x_m_s2:.6f}",
+                        f"{sample.accel_y_m_s2:.6f}",
+                        f"{sample.winding_temperature_c:.6f}",
+                    ]
+                )
+
+    def _reset_interface(self) -> None:
+        if self.poll_timer.isActive() or self.wiggle_timer.isActive() or self.zero_timer.isActive():
+            QMessageBox.warning(self, "Reset interface", "Stop or wait for the current action before resetting.")
+            return
+        if self._has_pending_export:
+            discard = QMessageBox.question(
+                self,
+                "Reset interface",
+                "There is captured dual-wheel data that has not been exported. Discard it and reset the interface?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if discard != QMessageBox.Yes:
+                return
+
+        for service in self.services.values():
+            service.stop()
+        self._main_samples = {"left": [], "right": []}
+        self._main_started_at = None
+        self._main_timestamp = ""
+        self._has_pending_export = False
+        self._is_main_running = False
+        self._main_phase = "idle"
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
+        self._pending_finish_message = ""
+        self._deployment_side = None
+        self._wiggle_side = None
+        self._wiggle_phase = "idle"
+        self._zero_started_at = None
+        self.test_number_input.setValue(DEFAULT_TEST_NUMBER)
+        self.direction_input.setCurrentIndex(0)
+        self.duration_input.setValue(10.0)
+        self.file_prefix_input.clear()
+        for side in ("left", "right"):
+            self.velocity_inputs[side].setValue(DEFAULT_VELOCITY_RPM)
+            self.mass_inputs[side].setValue(0.0)
+            for label in self.telemetry_labels_by_side[side].values():
+                label.setText("--")
+        self._reset_checklist()
+        self._reset_charts()
+        self.log_output.clear()
+        self.progress_bar.set_value(0)
+        self.progress_text.setText("Ready")
+        self.rover_diagram.set_active_side(None)
+        self._set_controls_idle()
+        self._update_role_labels()
+        self._append_log("Dual-wheel interface reset.")
+
+    def _set_controls_running(self) -> None:
+        self.start_button.setEnabled(False)
+        self.refresh_motors_button.setEnabled(False)
+        self.zero_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.reset_button.setEnabled(False)
+        self.change_output_directory_button.setEnabled(False)
+        for button in self.connect_buttons.values():
+            button.setEnabled(False)
+        for button in self.wiggle_buttons.values():
+            button.setEnabled(False)
+        for button in self.deployment_buttons.values():
+            button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+    def _set_controls_idle(self) -> None:
+        self.start_button.setEnabled(True)
+        self.refresh_motors_button.setEnabled(True)
+        self.zero_button.setEnabled(True)
+        self.reset_button.setEnabled(True)
+        self.change_output_directory_button.setEnabled(True)
+        for button in self.connect_buttons.values():
+            button.setEnabled(True)
+        for button in self.wiggle_buttons.values():
+            button.setEnabled(True)
+        for button in self.deployment_buttons.values():
+            button.setEnabled(self._has_pending_export)
+        self.stop_button.setEnabled(False)
+        self._update_export_button_state()
+
+    def _can_start_new_action(self) -> bool:
+        if self.poll_timer.isActive() or self.wiggle_timer.isActive() or self.zero_timer.isActive():
+            QMessageBox.warning(self, "Action in progress", "Wait for the current action to finish before starting another one.")
+            return False
+        return True
+
+    def _abort_active_motion(self, title: str, message: str) -> None:
+        self.poll_timer.stop()
+        for service in self.services.values():
+            service.stop()
+        self._is_main_running = False
+        self._deployment_side = None
+        self._main_started_at = None
+        self._main_phase = "idle"
+        self._motion_started_at = None
+        self._post_roll_started_at = None
+        self._motion_elapsed_before_post_roll = 0.0
+        self._pending_finish_message = ""
+        self.rover_diagram.set_active_side(None)
+        self.progress_bar.set_value(0)
+        self.progress_text.setText("Ready")
+        self._set_controls_idle()
+        self._append_log(message)
+        QMessageBox.warning(self, title, message)
+
+    def _update_role_labels(self) -> None:
+        direction = self.direction_input.currentText() if hasattr(self, "direction_input") else "Clockwise"
+        if hasattr(self, "rover_diagram"):
+            self.rover_diagram.set_direction(direction)
+        if hasattr(self, "assignment_label"):
+            self.assignment_label.setText(
+                f"FrontWheel: {self._side_for_role('FrontWheel').title()} | "
+                f"RearWheel: {self._side_for_role('RearWheel').title()}"
+            )
+
+    def _update_export_button_state(self) -> None:
+        ready = (
+            self._has_pending_export
+            and self.mass_inputs.get("left") is not None
+            and self.mass_inputs.get("right") is not None
+            and self.mass_inputs["left"].value() > 0.0
+            and self.mass_inputs["right"].value() > 0.0
+        )
+        if hasattr(self, "export_button"):
+            self.export_button.setEnabled(ready)
+
+    def _update_wheel_display(self, side: str, sample: TelemetrySample) -> None:
+        labels = self.telemetry_labels_by_side[side]
+        if not labels:
+            return
+        labels["position"].setText(f"{sample.position_rad:.3f} rad")
+        labels["velocity"].setText(f"{sample.velocity_rad_s:.3f} rad/s")
+        labels["effort"].setText(f"{sample.effort_nm:.3f} Nm")
+        labels["voltage"].setText(f"{sample.voltage_v:.2f} V")
+        labels["current"].setText(f"{sample.current_a:.3f} A")
+        labels["accel_x"].setText(f"{sample.accel_x_m_s2:.3f} m/s^2")
+        labels["temperature"].setText(f"{sample.winding_temperature_c:.2f} C")
+
+    def _update_charts(self, side: str, sample: TelemetrySample) -> None:
+        self.effort_series_by_side[side].append(sample.elapsed_seconds, sample.effort_nm)
+        self.power_series_by_side[side].append(sample.elapsed_seconds, self._power_w(sample))
+        self._trim_chart_series(self.effort_series_by_side[side])
+        self._trim_chart_series(self.power_series_by_side[side])
+        self._update_dual_chart_axes(self.effort_chart_view.chart(), self.effort_series_by_side)
+        self._update_dual_chart_axes(self.power_chart_view.chart(), self.power_series_by_side)
+
+    def _reset_charts(self) -> None:
+        for series in self.effort_series_by_side.values():
+            series.clear()
+        for series in self.power_series_by_side.values():
+            series.clear()
+        self._update_dual_chart_axes(self.effort_chart_view.chart(), self.effort_series_by_side)
+        self._update_dual_chart_axes(self.power_chart_view.chart(), self.power_series_by_side)
+
+    def _trim_chart_series(self, series: QLineSeries) -> None:
+        while series.count() > self._max_chart_points:
+            series.remove(0)
+
+    def _update_dual_chart_axes(self, chart: QChart, series_by_side: dict[str, QLineSeries]) -> None:
+        axes = chart.axes()
+        if len(axes) < 2:
+            return
+
+        points = []
+        for series in series_by_side.values():
+            points.extend(series.points())
+
+        axis_x = axes[0]
+        axis_y = axes[1]
+        if not points:
+            axis_x.setRange(0.0, 10.0)
+            axis_y.setRange(0.0, 10.0)
+            return
+
+        last_x = max(point.x() for point in points)
+        max_y = max(point.y() for point in points)
+        min_y = min(point.y() for point in points)
+        axis_x.setRange(max(0.0, last_x - 10.0), max(10.0, last_x))
+
+        if max_y == min_y:
+            padding = 1.0 if max_y == 0.0 else abs(max_y) * 0.1
+            axis_y.setRange(min_y - padding, max_y + padding)
+        else:
+            padding = max((max_y - min_y) * 0.1, 0.1)
+            axis_y.setRange(min_y - padding, max_y + padding)
+
+    def _reset_checklist(self) -> None:
+        for checkbox in self.checklist_boxes:
+            checkbox.setChecked(False)
+
+    def _both_wheels_connected(self) -> bool:
+        return self.left_service.is_connected and self.right_service.is_connected
+
+    def _same_module(self, first: DiscoveredModule, second: DiscoveredModule) -> bool:
+        return first.family == second.family and first.name == second.name
+
+    def _direction_sign(self) -> int:
+        return -1 if self.direction_input.currentText() == "Clockwise" else 1
+
+    def _side_for_role(self, role: str) -> str:
+        clockwise = self.direction_input.currentText() == "Clockwise" if hasattr(self, "direction_input") else True
+        if role == "FrontWheel":
+            return "right" if clockwise else "left"
+        return "left" if clockwise else "right"
+
+    def _rpm_to_rad_s(self, rpm: float) -> float:
+        return (rpm * 2.0 * 3.141592653589793) / 60.0
+
+    def _output_root(self) -> Path:
+        if self._output_directory is not None:
+            return self._output_directory
+        return _app_base_directory() / "data"
+
+    def _data_file_status_text(self) -> str:
+        return f"Output folder: {self._output_root()}"
+
+    def _file_prefix(self) -> str:
+        raw_prefix = self.file_prefix_input.text().strip()
+        cleaned = raw_prefix.replace(" ", "_")
+        safe_chars = []
+        for char in cleaned:
+            if char.isalnum() or char in {"_", "-"}:
+                safe_chars.append(char)
+        return "".join(safe_chars)
+
+    def _power_w(self, sample: TelemetrySample) -> float:
+        return sample.voltage_v * sample.current_a
+
+    def _append_log(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_output.appendPlainText(f"[{timestamp}] {message}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1247,12 +2353,17 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.choice_page = WheelChoicePage()
         self.single_wheel_page = SingleWheelTestPage(self.hebi_service)
+        self.two_wheel_page = TwoWheelTestPage()
         self.choice_page.single_wheel_selected.connect(self._open_single_wheel)
+        self.choice_page.two_wheel_selected.connect(self._open_two_wheel)
         self.single_wheel_page.back_requested.connect(self._open_choice)
         self.single_wheel_page.change_output_directory_requested.connect(self._change_output_directory)
+        self.two_wheel_page.back_requested.connect(self._open_choice)
+        self.two_wheel_page.change_output_directory_requested.connect(self._change_output_directory)
 
         self.stack.addWidget(self.choice_page)
         self.stack.addWidget(self.single_wheel_page)
+        self.stack.addWidget(self.two_wheel_page)
         self.setCentralWidget(self.stack)
         self._apply_styles()
         self._load_saved_output_directory()
@@ -1265,6 +2376,11 @@ class MainWindow(QMainWindow):
             return
         self.stack.setCurrentWidget(self.single_wheel_page)
 
+    def _open_two_wheel(self) -> None:
+        if self.output_directory is None and not self._choose_output_directory():
+            return
+        self.stack.setCurrentWidget(self.two_wheel_page)
+
     def _load_saved_output_directory(self) -> None:
         saved_directory = self.settings.value("output_directory", "", str)
         if not saved_directory:
@@ -1276,6 +2392,7 @@ class MainWindow(QMainWindow):
 
         self.output_directory = candidate
         self.single_wheel_page.set_output_directory(candidate)
+        self.two_wheel_page.set_output_directory(candidate)
 
     def _choose_output_directory(self) -> bool:
         default_directory = str(Path.home())
@@ -1291,7 +2408,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Output folder required",
-                "Choose an output folder before opening the single-wheel test screen.",
+                "Choose an output folder before opening a test screen.",
             )
             return False
 
@@ -1299,6 +2416,7 @@ class MainWindow(QMainWindow):
         self.output_directory = target
         self.settings.setValue("output_directory", str(target))
         self.single_wheel_page.set_output_directory(target)
+        self.two_wheel_page.set_output_directory(target)
         return True
 
     def _change_output_directory(self) -> None:
